@@ -35,10 +35,12 @@ use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use crate::advisory_lock::identity_lock_name;
-use crate::config::MysqlStorageConfig;
+use crate::config::{MysqlForeignKeyMode, MysqlStorageConfig};
 use crate::error::MysqlError;
-use crate::migrations::{Migration, run_migrations};
+use crate::migrations::Migration;
 use crate::pool::{create_pool, tx_opts};
+use crate::query::MysqlQueryExt;
+use spark_storage::TableNameRewriter;
 
 /// Name of the schema migrations table for `MysqlTreeStore`.
 const TREE_MIGRATIONS_TABLE: &str = "tree_schema_migrations";
@@ -82,12 +84,14 @@ impl LeafLike for SlimLeaf {
 
 /// `MySQL`-backed tree store implementation.
 ///
-/// Uses an application-level named lock to serialize writes (`GET_LOCK`) and
-/// row-level FK constraints to keep reservations and leaves in sync. Each
-/// instance is scoped to a single tenant identity so that multiple tenants
-/// can share one `MySQL` database without cross-pollinating tree state.
+/// Uses an application-level named lock to serialize writes (`GET_LOCK`) and,
+/// when configured to create foreign keys, row-level FK constraints to keep
+/// reservations and leaves in sync. Each instance is scoped to a single tenant
+/// identity so that multiple tenants can share one `MySQL` database without
+/// cross-pollinating tree state.
 pub struct MysqlTreeStore {
     pool: Pool,
+    table_names: TableNameRewriter,
     /// 33-byte secp256k1 compressed pubkey identifying this tenant. All reads
     /// and writes are filtered by `user_id = self.identity`.
     identity: Vec<u8>,
@@ -99,12 +103,21 @@ pub struct MysqlTreeStore {
     balance_changed_rx: watch::Receiver<()>,
 }
 
+impl MysqlQueryExt for MysqlTreeStore {
+    fn table_names(&self) -> &TableNameRewriter {
+        &self.table_names
+    }
+}
+
 /// Builds the multi-tenant scoping migration for the tree store. Adds
 /// `user_id VARBINARY(33)` to every per-user table, backfills with the
-/// connecting tenant's identity, and rewrites primary keys / FKs to lead
-/// with `user_id`.
+/// connecting tenant's identity, and rewrites primary keys / optional FKs /
+/// indexes to lead with `user_id`.
 #[allow(clippy::too_many_lines)]
-fn tree_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
+fn tree_store_multi_tenant_migration(
+    identity: &[u8],
+    foreign_key_mode: MysqlForeignKeyMode,
+) -> Vec<Migration> {
     let id_hex = hex::encode(identity);
     let id_lit = format!("UNHEX('{id_hex}')");
 
@@ -137,10 +150,11 @@ fn tree_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
     ));
 
     // tree_leaves: same pattern, plus re-add the composite FK to the new
-    // tree_reservations PK. The composite FK uses the default ON DELETE NO
-    // ACTION instead of the previous `ON DELETE SET NULL`: a whole-row SET NULL
-    // would null `user_id` (NOT NULL) and `MySQL` doesn't support column-list
-    // SET NULL. Callers (`cleanup_stale_reservations`, `cancel_reservation`,
+    // tree_reservations PK when foreign keys are enabled. The composite FK
+    // uses the default ON DELETE NO ACTION instead of the previous `ON DELETE
+    // SET NULL`: a whole-row SET NULL would null `user_id` (NOT NULL) and
+    // `MySQL` doesn't support column-list SET NULL. Callers
+    // (`cleanup_stale_reservations`, `cancel_reservation`,
     // `finalize_reservation`) explicitly clear `reservation_id` before
     // deleting the parent reservation row.
     stmts.push(Migration::AddColumn {
@@ -157,12 +171,15 @@ fn tree_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
     stmts.push(Migration::sql(
         "ALTER TABLE tree_leaves DROP PRIMARY KEY, ADD PRIMARY KEY (user_id, id)",
     ));
-    stmts.push(Migration::sql(
-        "ALTER TABLE tree_leaves \
-         ADD CONSTRAINT fk_tree_leaves_reservation_user \
-         FOREIGN KEY (user_id, reservation_id) \
-         REFERENCES tree_reservations(user_id, id)",
-    ));
+    if foreign_key_mode.creates_constraints() {
+        stmts.push(Migration::AddForeignKey {
+            name: "fk_tree_leaves_reservation_user",
+            table: "tree_leaves",
+            columns: "(user_id, reservation_id)",
+            referenced_table: "tree_reservations",
+            referenced_columns: "(user_id, id)",
+        });
+    }
     stmts.push(Migration::DropIndex {
         name: "idx_tree_leaves_available",
         table: "tree_leaves",
@@ -275,7 +292,8 @@ impl TreeStore for MysqlTreeStore {
         // only need the spendable total.
         let row: Option<i64> = conn
             .exec_first(
-                r"SELECT COALESCE(SUM(l.value), 0) AS balance
+                self.sql(
+                    r"SELECT COALESCE(SUM(l.value), 0) AS balance
                   FROM tree_leaves l
                   LEFT JOIN tree_reservations r
                     ON l.reservation_id = r.id AND l.user_id = r.user_id
@@ -284,6 +302,7 @@ impl TreeStore for MysqlTreeStore {
                         (l.reservation_id IS NULL AND l.status = 'Available')
                         OR r.purpose = 'Swap'
                     )",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -296,12 +315,14 @@ impl TreeStore for MysqlTreeStore {
 
         let rows: Vec<(String, String, bool, String, Option<String>, Option<String>)> = conn
             .exec(
-                r"SELECT l.id, l.status, l.is_missing_from_operators, l.data,
+                self.sql(
+                    r"SELECT l.id, l.status, l.is_missing_from_operators, l.data,
                          l.reservation_id, r.purpose
                   FROM tree_leaves l
                   LEFT JOIN tree_reservations r
                     ON l.reservation_id = r.id AND l.user_id = r.user_id
                   WHERE l.user_id = ?",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -476,48 +497,71 @@ impl MysqlTreeStore {
         config: MysqlStorageConfig,
         identity: &[u8],
     ) -> Result<Self, MysqlError> {
+        let table_names = TableNameRewriter::new(config.table_prefix.as_deref())
+            .map_err(|e| MysqlError::Initialization(e.to_string()))?;
         let pool = create_pool(&config)?;
-        Self::init(pool, identity).await
+        Self::init(pool, identity, config.foreign_key_mode, table_names).await
     }
 
     /// Creates a new `MysqlTreeStore` from an existing connection pool.
     /// `identity` is the 33-byte secp256k1 pubkey of the tenant.
     pub async fn from_pool(pool: Pool, identity: &[u8]) -> Result<Self, MysqlError> {
-        Self::init(pool, identity).await
+        Self::from_pool_with_options(pool, identity, MysqlForeignKeyMode::default(), None).await
     }
 
-    async fn init(pool: Pool, identity: &[u8]) -> Result<Self, MysqlError> {
+    /// Creates a new `MysqlTreeStore` from an existing connection pool with
+    /// both foreign-key mode and table prefix options.
+    pub async fn from_pool_with_options(
+        pool: Pool,
+        identity: &[u8],
+        foreign_key_mode: MysqlForeignKeyMode,
+        table_prefix: Option<&str>,
+    ) -> Result<Self, MysqlError> {
+        let table_names = TableNameRewriter::new(table_prefix)
+            .map_err(|e| MysqlError::Initialization(e.to_string()))?;
+        Self::init(pool, identity, foreign_key_mode, table_names).await
+    }
+
+    async fn init(
+        pool: Pool,
+        identity: &[u8],
+        foreign_key_mode: MysqlForeignKeyMode,
+        table_names: TableNameRewriter,
+    ) -> Result<Self, MysqlError> {
         let (balance_changed_tx, balance_changed_rx) = watch::channel(());
 
         let store = Self {
             pool,
+            table_names,
             identity: identity.to_vec(),
             lock_name: identity_lock_name(TREE_STORE_LOCK_PREFIX, identity),
             balance_changed_tx: Arc::new(balance_changed_tx),
             balance_changed_rx,
         };
 
-        store.migrate().await?;
+        store.migrate(foreign_key_mode).await?;
         store.notify_balance_change();
 
         Ok(store)
     }
 
-    async fn migrate(&self) -> Result<(), MysqlError> {
-        run_migrations(
+    async fn migrate(&self, foreign_key_mode: MysqlForeignKeyMode) -> Result<(), MysqlError> {
+        crate::migrations::run_migrations_with_table_names(
             &self.pool,
             TREE_MIGRATIONS_TABLE,
-            &Self::migrations(&self.identity),
+            &Self::migrations(&self.identity, foreign_key_mode),
+            &self.table_names,
         )
         .await
     }
 
-    fn migrations(identity: &[u8]) -> Vec<Vec<Migration>> {
+    fn migrations(identity: &[u8], foreign_key_mode: MysqlForeignKeyMode) -> Vec<Vec<Migration>> {
         vec![
             // Migration 1: Initial tree tables.
             //
             // Reservations are referenced via FK so that ON DELETE SET NULL
             // releases the leaves automatically when a reservation is dropped.
+            // This FK is omitted when foreign keys are disabled.
             vec![
                 Migration::sql(
                     "CREATE TABLE IF NOT EXISTS tree_reservations (
@@ -527,19 +571,7 @@ impl MysqlTreeStore {
                         created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                     )",
                 ),
-                Migration::sql(
-                    "CREATE TABLE IF NOT EXISTS tree_leaves (
-                        id VARCHAR(255) NOT NULL PRIMARY KEY,
-                        status VARCHAR(64) NOT NULL,
-                        is_missing_from_operators TINYINT(1) NOT NULL DEFAULT 0,
-                        reservation_id VARCHAR(255) NULL,
-                        data JSON NOT NULL,
-                        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        added_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        CONSTRAINT fk_tree_leaves_reservation FOREIGN KEY (reservation_id)
-                            REFERENCES tree_reservations(id) ON DELETE SET NULL
-                    )",
-                ),
+                Migration::sql(tree_leaves_create_table_sql(foreign_key_mode)),
                 Migration::sql(
                     "CREATE TABLE IF NOT EXISTS tree_spent_leaves (
                         leaf_id VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -604,10 +636,10 @@ impl MysqlTreeStore {
             ],
             // Migration 4: Multi-tenant scoping. Adds user_id to every tree-
             // store table, backfills with the connecting tenant's identity, and
-            // rewrites primary keys / FKs / indexes to lead with user_id. The
-            // `tree_swap_status` singleton is restructured the same way as
-            // `sync_revision` in the SDK-core storage.
-            tree_store_multi_tenant_migration(identity),
+            // rewrites primary keys / optional FKs / indexes to lead with
+            // user_id. The `tree_swap_status` singleton is restructured the
+            // same way as `sync_revision` in the SDK-core storage.
+            tree_store_multi_tenant_migration(identity, foreign_key_mode),
         ]
     }
 
@@ -687,12 +719,14 @@ impl MysqlTreeStore {
         // after this refresh started (making the refresh data potentially inconsistent).
         let row: Option<(i64, i64)> = tx
             .exec_first(
-                r"SELECT
+                self.sql(
+                    r"SELECT
                     (SELECT EXISTS(SELECT 1 FROM tree_reservations WHERE user_id = ? AND purpose = 'Swap')) AS has_active_swap,
                     COALESCE(
                         (SELECT (last_completed_at >= ?) FROM tree_swap_status WHERE user_id = ?),
                         0
                     ) AS swap_completed_during_refresh",
+                ),
                 (
                     self.identity.clone(),
                     refresh_timestamp.naive_utc(),
@@ -719,7 +753,9 @@ impl MysqlTreeStore {
 
         let spent_rows: Vec<String> = tx
             .exec(
-                "SELECT leaf_id FROM tree_spent_leaves WHERE user_id = ? AND spent_at >= ?",
+                self.sql(
+                    "SELECT leaf_id FROM tree_spent_leaves WHERE user_id = ? AND spent_at >= ?",
+                ),
                 (self.identity.clone(), refresh_timestamp.naive_utc()),
             )
             .await
@@ -737,7 +773,7 @@ impl MysqlTreeStore {
         // `cleanup_stale_reservations` (which clears `reservation_id`
         // explicitly because the composite FK uses NO ACTION).
         tx.exec_drop(
-            "DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id IS NULL AND added_at < ?",
+            self.sql("DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id IS NULL AND added_at < ?"),
             (self.identity.clone(), refresh_timestamp.naive_utc()),
         )
         .await
@@ -762,7 +798,7 @@ impl MysqlTreeStore {
 
         let exists: Option<String> = tx
             .exec_first(
-                "SELECT id FROM tree_reservations WHERE user_id = ? AND id = ?",
+                self.sql("SELECT id FROM tree_reservations WHERE user_id = ? AND id = ?"),
                 (self.identity.clone(), id),
             )
             .await
@@ -774,7 +810,7 @@ impl MysqlTreeStore {
 
         let prior_leaf_ids: Vec<String> = tx
             .exec(
-                "SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+                self.sql("SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
                 (self.identity.clone(), id),
             )
             .await
@@ -790,14 +826,14 @@ impl MysqlTreeStore {
         );
 
         tx.exec_drop(
-            "DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+            self.sql("DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
             (self.identity.clone(), id),
         )
         .await
         .map_err(map_err)?;
 
         tx.exec_drop(
-            "DELETE FROM tree_reservations WHERE user_id = ? AND id = ?",
+            self.sql("DELETE FROM tree_reservations WHERE user_id = ? AND id = ?"),
             (self.identity.clone(), id),
         )
         .await
@@ -820,7 +856,7 @@ impl MysqlTreeStore {
 
         let purpose: Option<String> = tx
             .exec_first(
-                "SELECT purpose FROM tree_reservations WHERE user_id = ? AND id = ?",
+                self.sql("SELECT purpose FROM tree_reservations WHERE user_id = ? AND id = ?"),
                 (self.identity.clone(), id),
             )
             .await
@@ -830,7 +866,7 @@ impl MysqlTreeStore {
             let is_swap = purpose == "Swap";
             let leaf_ids: Vec<String> = tx
                 .exec(
-                    "SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+                    self.sql("SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
                     (self.identity.clone(), id),
                 )
                 .await
@@ -851,14 +887,14 @@ impl MysqlTreeStore {
             .await?;
 
         tx.exec_drop(
-            "DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+            self.sql("DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
             (self.identity.clone(), id),
         )
         .await
         .map_err(map_err)?;
 
         tx.exec_drop(
-            "DELETE FROM tree_reservations WHERE user_id = ? AND id = ?",
+            self.sql("DELETE FROM tree_reservations WHERE user_id = ? AND id = ?"),
             (self.identity.clone(), id),
         )
         .await
@@ -880,8 +916,10 @@ impl MysqlTreeStore {
         // no row) gets one created lazily.
         if is_swap && new_leaves.is_some() {
             tx.exec_drop(
-                "INSERT INTO tree_swap_status (user_id, last_completed_at) VALUES (?, NOW(6))
+                self.sql(
+                    "INSERT INTO tree_swap_status (user_id, last_completed_at) VALUES (?, NOW(6))
                  ON DUPLICATE KEY UPDATE last_completed_at = VALUES(last_completed_at)",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -911,12 +949,14 @@ impl MysqlTreeStore {
         // slim set since the prefilter excludes big leaves.
         let total_row: Option<i64> = tx
             .exec_first(
-                r"SELECT COALESCE(SUM(value), 0) AS total
+                self.sql(
+                    r"SELECT COALESCE(SUM(value), 0) AS total
                   FROM tree_leaves
                   WHERE user_id = ?
                     AND status = 'Available'
                     AND is_missing_from_operators = 0
                     AND reservation_id IS NULL",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -927,7 +967,8 @@ impl MysqlTreeStore {
         let max_target_signed: i64 = i64::try_from(max_target).unwrap_or(i64::MAX);
         let slim_rows: Vec<(String, i64)> = tx
             .exec(
-                r"SELECT id, value
+                self.sql(
+                    r"SELECT id, value
                   FROM tree_leaves
                   WHERE user_id = ?
                     AND status = 'Available'
@@ -948,6 +989,7 @@ impl MysqlTreeStore {
                         ) AS smallest_over
                       )
                     )",
+                ),
                 (
                     self.identity.clone(),
                     max_target_signed,
@@ -1088,6 +1130,7 @@ impl MysqlTreeStore {
         let sql = format!(
             "SELECT id, data FROM tree_leaves WHERE user_id = ? AND id IN ({placeholders})"
         );
+        let sql = self.sql(&sql);
         let mut params: Vec<Value> = Vec::with_capacity(ids.len().saturating_add(1));
         params.push(Value::from(self.identity.clone()));
         params.extend(ids.iter().cloned().map(Value::from));
@@ -1122,7 +1165,7 @@ impl MysqlTreeStore {
 
         let exists: Option<String> = tx
             .exec_first(
-                "SELECT id FROM tree_reservations WHERE user_id = ? AND id = ?",
+                self.sql("SELECT id FROM tree_reservations WHERE user_id = ? AND id = ?"),
                 (self.identity.clone(), reservation_id),
             )
             .await
@@ -1136,7 +1179,7 @@ impl MysqlTreeStore {
 
         let old_reserved_leaf_ids: Vec<String> = tx
             .exec(
-                "SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+                self.sql("SELECT id FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
                 (self.identity.clone(), reservation_id),
             )
             .await
@@ -1145,7 +1188,7 @@ impl MysqlTreeStore {
         self.batch_insert_spent_leaves(&mut tx, &old_reserved_leaf_ids)
             .await?;
         tx.exec_drop(
-            "DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?",
+            self.sql("DELETE FROM tree_leaves WHERE user_id = ? AND reservation_id = ?"),
             (self.identity.clone(), reservation_id),
         )
         .await
@@ -1161,7 +1204,7 @@ impl MysqlTreeStore {
             .await?;
 
         tx.exec_drop(
-            "UPDATE tree_reservations SET pending_change_amount = 0 WHERE user_id = ? AND id = ?",
+            self.sql("UPDATE tree_reservations SET pending_change_amount = 0 WHERE user_id = ? AND id = ?"),
             (self.identity.clone(), reservation_id),
         )
         .await
@@ -1181,7 +1224,7 @@ impl MysqlTreeStore {
     ) -> Result<u64, TreeServiceError> {
         let row: Option<i64> = tx
             .exec_first(
-                "SELECT COALESCE(SUM(pending_change_amount), 0) FROM tree_reservations WHERE user_id = ?",
+                self.sql("SELECT COALESCE(SUM(pending_change_amount), 0) FROM tree_reservations WHERE user_id = ?"),
                 (self.identity.clone(),),
             )
             .await
@@ -1251,6 +1294,7 @@ impl MysqlTreeStore {
                 added_at = NOW(6)",
         );
 
+        let sql = self.sql(&sql);
         tx.exec_drop(&sql, Params::Positional(params))
             .await
             .map_err(map_err)?;
@@ -1273,6 +1317,7 @@ impl MysqlTreeStore {
         let sql = format!(
             "UPDATE tree_leaves SET reservation_id = ? WHERE user_id = ? AND id IN ({placeholders})"
         );
+        let sql = self.sql(&sql);
 
         let mut params: Vec<Value> = Vec::with_capacity(leaf_ids.len() + 2);
         params.push(Value::from(reservation_id));
@@ -1312,6 +1357,7 @@ impl MysqlTreeStore {
         // propagate.
         sql.push_str(" ON DUPLICATE KEY UPDATE leaf_id = leaf_id");
 
+        let sql = self.sql(&sql);
         tx.exec_drop(&sql, Params::Positional(params))
             .await
             .map_err(map_err)?;
@@ -1332,6 +1378,7 @@ impl MysqlTreeStore {
         let sql = format!(
             "DELETE FROM tree_spent_leaves WHERE user_id = ? AND leaf_id IN ({placeholders})"
         );
+        let sql = self.sql(&sql);
 
         let mut params: Vec<Value> = Vec::with_capacity(leaf_ids.len().saturating_add(1));
         params.push(Value::from(self.identity.clone()));
@@ -1364,7 +1411,8 @@ impl MysqlTreeStore {
     ) -> Result<u64, TreeServiceError> {
         // Release dependent leaves before dropping the parent rows.
         tx.exec_drop(
-            r"UPDATE tree_leaves SET reservation_id = NULL
+            self.sql(
+                r"UPDATE tree_leaves SET reservation_id = NULL
               WHERE user_id = ?
                 AND reservation_id IN (
                     SELECT id FROM (
@@ -1373,6 +1421,7 @@ impl MysqlTreeStore {
                           AND created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
                     ) AS stale
                 )",
+            ),
             (
                 self.identity.clone(),
                 self.identity.clone(),
@@ -1384,8 +1433,10 @@ impl MysqlTreeStore {
 
         let mut result = tx
             .exec_iter(
-                "DELETE FROM tree_reservations
+                self.sql(
+                    "DELETE FROM tree_reservations
                  WHERE user_id = ? AND created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)",
+                ),
                 (self.identity.clone(), RESERVATION_TIMEOUT_SECS),
             )
             .await
@@ -1412,7 +1463,7 @@ impl MysqlTreeStore {
 
         let mut result = tx
             .exec_iter(
-                "DELETE FROM tree_spent_leaves WHERE user_id = ? AND spent_at < ?",
+                self.sql("DELETE FROM tree_spent_leaves WHERE user_id = ? AND spent_at < ?"),
                 (self.identity.clone(), cleanup_cutoff.naive_utc()),
             )
             .await
@@ -1439,7 +1490,7 @@ impl MysqlTreeStore {
         let pending_i64 = pending_change as i64;
 
         tx.exec_drop(
-            "INSERT INTO tree_reservations (user_id, id, purpose, pending_change_amount) VALUES (?, ?, ?, ?)",
+            self.sql("INSERT INTO tree_reservations (user_id, id, purpose, pending_change_amount) VALUES (?, ?, ?, ?)"),
             (self.identity.clone(), reservation_id, purpose.to_string(), pending_i64),
         )
         .await
@@ -1469,6 +1520,28 @@ fn build_placeholders(n: usize) -> String {
     s
 }
 
+fn tree_leaves_create_table_sql(foreign_key_mode: MysqlForeignKeyMode) -> String {
+    let reservation_fk = if foreign_key_mode.creates_constraints() {
+        ",
+                        CONSTRAINT fk_tree_leaves_reservation FOREIGN KEY (reservation_id)
+                            REFERENCES tree_reservations(id) ON DELETE SET NULL"
+    } else {
+        ""
+    };
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS tree_leaves (
+                        id VARCHAR(255) NOT NULL PRIMARY KEY,
+                        status VARCHAR(64) NOT NULL,
+                        is_missing_from_operators TINYINT(1) NOT NULL DEFAULT 0,
+                        reservation_id VARCHAR(255) NULL,
+                        data JSON NOT NULL,
+                        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        added_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6){reservation_fk}
+                    )"
+    )
+}
+
 fn map_err<E: std::fmt::Display>(e: E) -> TreeServiceError {
     TreeServiceError::Generic(e.to_string())
 }
@@ -1495,6 +1568,22 @@ pub async fn create_mysql_tree_store_from_pool(
     Ok(Arc::new(MysqlTreeStore::from_pool(pool, identity).await?))
 }
 
+/// Creates a `MysqlTreeStore` instance from an existing connection pool with
+/// both foreign-key mode and table prefix options.
+///
+/// `identity` is the 33-byte secp256k1 pubkey scoping all reads and writes.
+pub async fn create_mysql_tree_store_from_pool_with_options(
+    pool: Pool,
+    identity: &[u8],
+    foreign_key_mode: MysqlForeignKeyMode,
+    table_prefix: Option<&str>,
+) -> Result<Arc<dyn TreeStore>, MysqlError> {
+    Ok(Arc::new(
+        MysqlTreeStore::from_pool_with_options(pool, identity, foreign_key_mode, table_prefix)
+            .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,6 +1600,72 @@ mod tests {
         0x1e, 0x1f, 0x20,
     ];
 
+    fn migration_sql_contains(migrations: &[Vec<Migration>], needle: &str) -> bool {
+        migrations
+            .iter()
+            .flatten()
+            .any(|migration| matches!(migration, Migration::Sql(sql) if sql.contains(needle)))
+    }
+
+    fn migration_adds_foreign_key(migrations: &[Vec<Migration>], name: &str, table: &str) -> bool {
+        migrations.iter().flatten().any(|migration| {
+            matches!(
+                migration,
+                Migration::AddForeignKey {
+                    name: fk_name,
+                    table: fk_table,
+                    ..
+                } if *fk_name == name && *fk_table == table
+            )
+        })
+    }
+
+    #[test]
+    fn enforced_foreign_key_mode_includes_tree_constraints() {
+        let migrations = MysqlTreeStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        assert!(migration_sql_contains(
+            &migrations,
+            "fk_tree_leaves_reservation FOREIGN KEY"
+        ));
+        assert!(migration_adds_foreign_key(
+            &migrations,
+            "fk_tree_leaves_reservation_user",
+            "tree_leaves"
+        ));
+    }
+
+    #[test]
+    fn disabled_foreign_key_mode_omits_tree_constraints() {
+        let migrations = MysqlTreeStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Disabled);
+
+        assert!(!migration_sql_contains(&migrations, "FOREIGN KEY"));
+        assert!(migrations.iter().flatten().any(|migration| matches!(
+            migration,
+            Migration::DropForeignKey {
+                name: "fk_tree_leaves_reservation",
+                table: "tree_leaves"
+            }
+        )));
+    }
+
+    #[test]
+    fn tree_migrations_prefix_all_schema_objects() {
+        let migrations = MysqlTreeStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        crate::migrations::assert_migrations_prefix_schema_objects(&migrations, "breez_");
+    }
+
+    #[test]
+    fn tree_migrations_schema_objects_are_known() {
+        let migrations = MysqlTreeStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        crate::migrations::assert_migrations_schema_objects_known(
+            &migrations,
+            &[TREE_MIGRATIONS_TABLE],
+        );
+    }
+
     /// Helper struct that holds the container and store together.
     /// The container must be kept alive for the duration of the test.
     struct MysqlTreeStoreTestFixture {
@@ -1521,6 +1676,10 @@ mod tests {
 
     impl MysqlTreeStoreTestFixture {
         async fn new() -> Self {
+            Self::new_with_foreign_key_mode(MysqlForeignKeyMode::default()).await
+        }
+
+        async fn new_with_foreign_key_mode(foreign_key_mode: MysqlForeignKeyMode) -> Self {
             let container = Mysql::default()
                 .start()
                 .await
@@ -1535,12 +1694,11 @@ mod tests {
             // and no password.
             let connection_string = format!("mysql://root@127.0.0.1:{host_port}/test");
 
-            let store = MysqlTreeStore::from_config(
-                MysqlStorageConfig::with_defaults(connection_string),
-                &TEST_IDENTITY,
-            )
-            .await
-            .expect("Failed to create MysqlTreeStore");
+            let mut config = MysqlStorageConfig::with_defaults(connection_string);
+            config.foreign_key_mode = foreign_key_mode;
+            let store = MysqlTreeStore::from_config(config, &TEST_IDENTITY)
+                .await
+                .expect("Failed to create MysqlTreeStore");
 
             Self { store, container }
         }
@@ -1565,6 +1723,38 @@ mod tests {
     async fn test_new() {
         let fixture = MysqlTreeStoreTestFixture::new().await;
         shared_tests::test_new(&fixture.store).await;
+    }
+
+    #[tokio::test]
+    async fn test_new_with_disabled_foreign_key_mode() {
+        let fixture =
+            MysqlTreeStoreTestFixture::new_with_foreign_key_mode(MysqlForeignKeyMode::Disabled)
+                .await;
+        shared_tests::test_new(&fixture.store).await;
+
+        let mut conn = fixture
+            .store
+            .pool
+            .get_conn()
+            .await
+            .expect("Failed to get MySQL connection");
+        let count: Option<u64> = conn
+            .query_first(
+                "SELECT COUNT(*)
+                 FROM information_schema.table_constraints
+                 WHERE constraint_schema = DATABASE()
+                   AND constraint_type = 'FOREIGN KEY'
+                   AND table_name IN (
+                       'tree_leaves',
+                       'tree_reservations',
+                       'tree_spent_leaves',
+                       'tree_swap_status'
+                   )",
+            )
+            .await
+            .expect("Failed to count tree store foreign keys");
+
+        assert_eq!(count, Some(0));
     }
 
     #[tokio::test]

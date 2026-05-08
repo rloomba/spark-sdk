@@ -9,6 +9,7 @@ use std::time::Duration;
 use mysql_async::{
     IsolationLevel, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, TxOpts,
 };
+use spark_storage::validate_table_prefix;
 
 use crate::config::MysqlStorageConfig;
 use crate::error::MysqlError;
@@ -35,6 +36,9 @@ pub fn tx_opts() -> TxOpts {
 /// - `verify_ca` / `verify_identity` — TLS with the CA from `root_ca_pem`
 ///   (or system roots if not provided)
 pub fn create_pool(config: &MysqlStorageConfig) -> Result<Pool, MysqlError> {
+    validate_table_prefix(config.table_prefix.as_deref().unwrap_or_default())
+        .map_err(|e| MysqlError::Initialization(e.to_string()))?;
+
     let opts: Opts = Opts::from_url(&config.connection_string)
         .map_err(|e| MysqlError::Initialization(format!("Invalid connection string: {e}")))?;
 

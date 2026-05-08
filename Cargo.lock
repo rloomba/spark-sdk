@@ -5047,6 +5047,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spark-mysql",
+ "spark-storage",
  "spark-wallet",
  "testcontainers",
  "testcontainers-modules",
@@ -5073,6 +5074,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spark-postgres",
+ "spark-storage",
  "spark-wallet",
  "testcontainers",
  "testcontainers-modules",
@@ -5084,6 +5086,10 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.7",
 ]
+
+[[package]]
+name = "spark-storage"
+version = "0.1.0"
 
 [[package]]
 name = "spark-wallet"

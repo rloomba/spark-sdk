@@ -21,10 +21,12 @@ use tracing::{trace, warn};
 use uuid::Uuid;
 
 use crate::advisory_lock::identity_lock_name;
-use crate::config::MysqlStorageConfig;
+use crate::config::{MysqlForeignKeyMode, MysqlStorageConfig};
 use crate::error::MysqlError;
-use crate::migrations::{Migration, run_migrations};
+use crate::migrations::Migration;
 use crate::pool::{create_pool, tx_opts};
+use crate::query::MysqlQueryExt;
+use spark_storage::TableNameRewriter;
 
 const TOKEN_MIGRATIONS_TABLE: &str = "token_schema_migrations";
 
@@ -43,6 +45,7 @@ const RESERVATION_TIMEOUT_SECS: i64 = 300;
 /// can share one `MySQL` database without cross-pollinating token state.
 pub struct MysqlTokenStore {
     pool: Pool,
+    table_names: TableNameRewriter,
     /// 33-byte secp256k1 compressed pubkey identifying this tenant. All reads
     /// and writes are filtered by `user_id = self.identity`.
     identity: Vec<u8>,
@@ -50,13 +53,22 @@ pub struct MysqlTokenStore {
     lock_name: String,
 }
 
+impl MysqlQueryExt for MysqlTokenStore {
+    fn table_names(&self) -> &TableNameRewriter {
+        &self.table_names
+    }
+}
+
 /// Builds the multi-tenant scoping migration for the token store. Adds
 /// `user_id VARBINARY(33)` to every per-user table (including
 /// `token_metadata` — metadata is per-tenant to avoid 0-balance leakage for
 /// tokens a tenant never owned), backfills with the connecting tenant, and
-/// rewrites primary keys / FKs to lead with `user_id`.
+/// rewrites primary keys / optional FKs to lead with `user_id`.
 #[allow(clippy::too_many_lines)]
-fn token_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
+fn token_store_multi_tenant_migration(
+    identity: &[u8],
+    foreign_key_mode: MysqlForeignKeyMode,
+) -> Vec<Migration> {
     let id_hex = hex::encode(identity);
     let id_lit = format!("UNHEX('{id_hex}')");
 
@@ -117,7 +129,8 @@ fn token_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
         "ALTER TABLE token_reservations DROP PRIMARY KEY, ADD PRIMARY KEY (user_id, id)",
     ));
 
-    // token_outputs: scope by user_id, rekey, re-add composite FKs.
+    // token_outputs: scope by user_id, rekey, re-add composite FKs when
+    // foreign keys are enabled.
     stmts.push(Migration::AddColumn {
         table: "token_outputs",
         column: "user_id",
@@ -135,18 +148,22 @@ fn token_store_multi_tenant_migration(identity: &[u8]) -> Vec<Migration> {
     // Re-add the FKs as composite, scoped by user_id. The reservation FK uses
     // NO ACTION (the default) instead of the previous `ON DELETE SET NULL`:
     // a whole-row SET NULL would null `user_id` (NOT NULL).
-    stmts.push(Migration::sql(
-        "ALTER TABLE token_outputs \
-         ADD CONSTRAINT fk_token_outputs_metadata_user \
-         FOREIGN KEY (user_id, token_identifier) \
-         REFERENCES token_metadata(user_id, identifier)",
-    ));
-    stmts.push(Migration::sql(
-        "ALTER TABLE token_outputs \
-         ADD CONSTRAINT fk_token_outputs_reservation_user \
-         FOREIGN KEY (user_id, reservation_id) \
-         REFERENCES token_reservations(user_id, id)",
-    ));
+    if foreign_key_mode.creates_constraints() {
+        stmts.push(Migration::AddForeignKey {
+            name: "fk_token_outputs_metadata_user",
+            table: "token_outputs",
+            columns: "(user_id, token_identifier)",
+            referenced_table: "token_metadata",
+            referenced_columns: "(user_id, identifier)",
+        });
+        stmts.push(Migration::AddForeignKey {
+            name: "fk_token_outputs_reservation_user",
+            table: "token_outputs",
+            columns: "(user_id, reservation_id)",
+            referenced_table: "token_reservations",
+            referenced_columns: "(user_id, id)",
+        });
+    }
     stmts.push(Migration::DropIndex {
         name: "idx_token_outputs_identifier",
         table: "token_outputs",
@@ -239,7 +256,8 @@ impl TokenOutputStore for MysqlTokenStore {
         // SUM works across full u128 range, then return as TEXT for parsing.
         let rows: Vec<Row> = conn
             .exec(
-                r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
+                self.sql(
+                    r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
                          m.max_supply, m.is_freezable, m.creation_entity_public_key,
                          CAST(COALESCE(SUM(
                             CASE
@@ -256,6 +274,7 @@ impl TokenOutputStore for MysqlTokenStore {
                   WHERE m.user_id = ?
                   GROUP BY m.identifier, m.issuer_public_key, m.name, m.ticker,
                            m.decimals, m.max_supply, m.is_freezable, m.creation_entity_public_key",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -277,7 +296,8 @@ impl TokenOutputStore for MysqlTokenStore {
 
         let rows: Vec<Row> = conn
             .exec(
-                r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
+                self.sql(
+                    r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
                          m.max_supply, m.is_freezable, m.creation_entity_public_key,
                          o.id AS output_id, o.owner_public_key, o.revocation_commitment,
                          o.withdraw_bond_sats, o.withdraw_relative_block_locktime,
@@ -291,6 +311,7 @@ impl TokenOutputStore for MysqlTokenStore {
                     ON o.reservation_id = r.id AND o.user_id = r.user_id
                   WHERE m.user_id = ?
                   ORDER BY m.identifier, CAST(o.token_amount AS DECIMAL(65,0)) ASC",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -366,6 +387,7 @@ impl TokenOutputStore for MysqlTokenStore {
               WHERE m.user_id = ? AND {where_clause}
               ORDER BY CAST(o.token_amount AS DECIMAL(65,0)) ASC"
         );
+        let query = self.sql(&query);
 
         let rows: Vec<Row> = conn
             .exec(&query, (self.identity.clone(), param))
@@ -427,6 +449,7 @@ impl TokenOutputStore for MysqlTokenStore {
             let sql = format!(
                 "DELETE FROM token_spent_outputs WHERE user_id = ? AND output_id IN ({placeholders})"
             );
+            let sql = self.sql(&sql);
             let mut params: Vec<Value> = Vec::with_capacity(output_ids.len().saturating_add(1));
             params.push(Value::from(self.identity.clone()));
             params.extend(output_ids.iter().cloned().map(Value::from));
@@ -535,35 +558,57 @@ impl MysqlTokenStore {
         config: MysqlStorageConfig,
         identity: &[u8],
     ) -> Result<Self, MysqlError> {
+        let table_names = TableNameRewriter::new(config.table_prefix.as_deref())
+            .map_err(|e| MysqlError::Initialization(e.to_string()))?;
         let pool = create_pool(&config)?;
-        Self::init(pool, identity).await
+        Self::init(pool, identity, config.foreign_key_mode, table_names).await
     }
 
     /// `identity` is the 33-byte secp256k1 pubkey of the tenant.
     pub async fn from_pool(pool: Pool, identity: &[u8]) -> Result<Self, MysqlError> {
-        Self::init(pool, identity).await
+        Self::from_pool_with_options(pool, identity, MysqlForeignKeyMode::default(), None).await
     }
 
-    async fn init(pool: Pool, identity: &[u8]) -> Result<Self, MysqlError> {
+    /// Creates a new `MysqlTokenStore` from an existing connection pool with
+    /// both foreign-key mode and table prefix options.
+    pub async fn from_pool_with_options(
+        pool: Pool,
+        identity: &[u8],
+        foreign_key_mode: MysqlForeignKeyMode,
+        table_prefix: Option<&str>,
+    ) -> Result<Self, MysqlError> {
+        let table_names = TableNameRewriter::new(table_prefix)
+            .map_err(|e| MysqlError::Initialization(e.to_string()))?;
+        Self::init(pool, identity, foreign_key_mode, table_names).await
+    }
+
+    async fn init(
+        pool: Pool,
+        identity: &[u8],
+        foreign_key_mode: MysqlForeignKeyMode,
+        table_names: TableNameRewriter,
+    ) -> Result<Self, MysqlError> {
         let store = Self {
             pool,
+            table_names,
             identity: identity.to_vec(),
             lock_name: identity_lock_name(TOKEN_STORE_LOCK_PREFIX, identity),
         };
-        store.migrate().await?;
+        store.migrate(foreign_key_mode).await?;
         Ok(store)
     }
 
-    async fn migrate(&self) -> Result<(), MysqlError> {
-        run_migrations(
+    async fn migrate(&self, foreign_key_mode: MysqlForeignKeyMode) -> Result<(), MysqlError> {
+        crate::migrations::run_migrations_with_table_names(
             &self.pool,
             TOKEN_MIGRATIONS_TABLE,
-            &Self::migrations(&self.identity),
+            &Self::migrations(&self.identity, foreign_key_mode),
+            &self.table_names,
         )
         .await
     }
 
-    fn migrations(identity: &[u8]) -> Vec<Vec<Migration>> {
+    fn migrations(identity: &[u8], foreign_key_mode: MysqlForeignKeyMode) -> Vec<Vec<Migration>> {
         vec![
             vec![
                 Migration::sql(
@@ -590,26 +635,7 @@ impl MysqlTokenStore {
                         created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
                     )",
                 ),
-                Migration::sql(
-                    "CREATE TABLE IF NOT EXISTS token_outputs (
-                        id VARCHAR(255) NOT NULL PRIMARY KEY,
-                        token_identifier VARCHAR(255) NOT NULL,
-                        owner_public_key VARCHAR(255) NOT NULL,
-                        revocation_commitment VARCHAR(255) NOT NULL,
-                        withdraw_bond_sats BIGINT NOT NULL,
-                        withdraw_relative_block_locktime BIGINT NOT NULL,
-                        token_public_key VARCHAR(255) NULL,
-                        token_amount VARCHAR(128) NOT NULL,
-                        prev_tx_hash VARCHAR(255) NOT NULL,
-                        prev_tx_vout INT NOT NULL,
-                        reservation_id VARCHAR(255) NULL,
-                        added_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        CONSTRAINT fk_token_outputs_metadata FOREIGN KEY (token_identifier)
-                            REFERENCES token_metadata(identifier),
-                        CONSTRAINT fk_token_outputs_reservation FOREIGN KEY (reservation_id)
-                            REFERENCES token_reservations(id) ON DELETE SET NULL
-                    )",
-                ),
+                Migration::sql(token_outputs_create_table_sql(foreign_key_mode)),
                 Migration::CreateIndex {
                     name: "idx_token_outputs_identifier",
                     table: "token_outputs",
@@ -639,7 +665,7 @@ impl MysqlTokenStore {
                 ),
             ],
             // Migration 2: Multi-tenant scoping.
-            token_store_multi_tenant_migration(identity),
+            token_store_multi_tenant_migration(identity, foreign_key_mode),
         ]
     }
 
@@ -678,12 +704,14 @@ impl MysqlTokenStore {
 
         let row: Option<(i64, i64)> = tx
             .exec_first(
-                r"SELECT
+                self.sql(
+                    r"SELECT
                     (SELECT EXISTS(SELECT 1 FROM token_reservations WHERE user_id = ? AND purpose = 'Swap')) AS has_active_swap,
                     COALESCE(
                         (SELECT (last_completed_at >= ?) FROM token_swap_status WHERE user_id = ?),
                         0
                     ) AS swap_completed_during_refresh",
+                ),
                 (
                     self.identity.clone(),
                     refresh_timestamp.naive_utc(),
@@ -710,7 +738,9 @@ impl MysqlTokenStore {
 
         let spent_rows: Vec<String> = tx
             .exec(
-                "SELECT output_id FROM token_spent_outputs WHERE user_id = ? AND spent_at >= ?",
+                self.sql(
+                    "SELECT output_id FROM token_spent_outputs WHERE user_id = ? AND spent_at >= ?",
+                ),
                 (self.identity.clone(), refresh_timestamp.naive_utc()),
             )
             .await
@@ -718,7 +748,7 @@ impl MysqlTokenStore {
         let spent_ids: HashSet<String> = spent_rows.into_iter().collect();
 
         tx.exec_drop(
-            "DELETE FROM token_outputs WHERE user_id = ? AND reservation_id IS NULL AND added_at < ?",
+            self.sql("DELETE FROM token_outputs WHERE user_id = ? AND reservation_id IS NULL AND added_at < ?"),
             (self.identity.clone(), refresh_timestamp.naive_utc()),
         )
         .await
@@ -731,11 +761,13 @@ impl MysqlTokenStore {
 
         let reserved_pairs: Vec<(String, String)> = tx
             .exec(
-                r"SELECT r.id, o.id
+                self.sql(
+                    r"SELECT r.id, o.id
                   FROM token_reservations r
                   JOIN token_outputs o
                     ON o.reservation_id = r.id AND o.user_id = r.user_id
                   WHERE r.user_id = ?",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -772,6 +804,7 @@ impl MysqlTokenStore {
             let outputs_sql = format!(
                 "DELETE FROM token_outputs WHERE user_id = ? AND reservation_id IN ({placeholders})"
             );
+            let outputs_sql = self.sql(&outputs_sql);
             let mut outputs_params: Vec<Value> =
                 Vec::with_capacity(reservations_to_delete.len().saturating_add(1));
             outputs_params.push(Value::from(self.identity.clone()));
@@ -783,6 +816,7 @@ impl MysqlTokenStore {
             let res_sql = format!(
                 "DELETE FROM token_reservations WHERE user_id = ? AND id IN ({placeholders})"
             );
+            let res_sql = self.sql(&res_sql);
             let mut res_params: Vec<Value> =
                 Vec::with_capacity(reservations_to_delete.len().saturating_add(1));
             res_params.push(Value::from(self.identity.clone()));
@@ -796,6 +830,7 @@ impl MysqlTokenStore {
             let placeholders = build_placeholders(outputs_to_remove_from_reservation.len());
             let sql =
                 format!("DELETE FROM token_outputs WHERE user_id = ? AND id IN ({placeholders})");
+            let sql = self.sql(&sql);
             let mut params: Vec<Value> =
                 Vec::with_capacity(outputs_to_remove_from_reservation.len().saturating_add(1));
             params.push(Value::from(self.identity.clone()));
@@ -811,10 +846,12 @@ impl MysqlTokenStore {
 
             let empty_ids: Vec<String> = tx
                 .exec(
-                    r"SELECT r.id FROM token_reservations r
+                    self.sql(
+                        r"SELECT r.id FROM token_reservations r
                       LEFT JOIN token_outputs o
                         ON o.reservation_id = r.id AND o.user_id = r.user_id
                       WHERE r.user_id = ? AND o.id IS NULL",
+                    ),
                     (self.identity.clone(),),
                 )
                 .await
@@ -824,6 +861,7 @@ impl MysqlTokenStore {
                 let sql = format!(
                     "DELETE FROM token_reservations WHERE user_id = ? AND id IN ({placeholders})"
                 );
+                let sql = self.sql(&sql);
                 let mut params: Vec<Value> = Vec::with_capacity(empty_ids.len().saturating_add(1));
                 params.push(Value::from(self.identity.clone()));
                 params.extend(empty_ids.iter().cloned().map(Value::from));
@@ -835,7 +873,9 @@ impl MysqlTokenStore {
 
         let reserved_output_ids: HashSet<String> = tx
             .exec::<String, _, _>(
-                "SELECT id FROM token_outputs WHERE user_id = ? AND reservation_id IS NOT NULL",
+                self.sql(
+                    "SELECT id FROM token_outputs WHERE user_id = ? AND reservation_id IS NOT NULL",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -845,11 +885,13 @@ impl MysqlTokenStore {
 
         // Drop tenant-scoped metadata rows that no longer have any outputs.
         tx.exec_drop(
-            r"DELETE FROM token_metadata
+            self.sql(
+                r"DELETE FROM token_metadata
               WHERE user_id = ?
                 AND identifier NOT IN (
                   SELECT DISTINCT token_identifier FROM token_outputs WHERE user_id = ?
               )",
+            ),
             (self.identity.clone(), self.identity.clone()),
         )
         .await
@@ -889,7 +931,7 @@ impl MysqlTokenStore {
 
         let metadata_row: Option<Row> = tx
             .exec_first(
-                "SELECT * FROM token_metadata WHERE user_id = ? AND identifier = ?",
+                self.sql("SELECT * FROM token_metadata WHERE user_id = ? AND identifier = ?"),
                 (self.identity.clone(), token_identifier),
             )
             .await
@@ -903,12 +945,14 @@ impl MysqlTokenStore {
 
         let rows: Vec<Row> = tx
             .exec(
-                r"SELECT o.id AS output_id, o.owner_public_key, o.revocation_commitment,
+                self.sql(
+                    r"SELECT o.id AS output_id, o.owner_public_key, o.revocation_commitment,
                          o.withdraw_bond_sats, o.withdraw_relative_block_locktime,
                          o.token_public_key, o.token_amount, o.prev_tx_hash, o.prev_tx_vout,
                          o.token_identifier
                   FROM token_outputs o
                   WHERE o.user_id = ? AND o.token_identifier = ? AND o.reservation_id IS NULL",
+                ),
                 (self.identity.clone(), token_identifier),
             )
             .await
@@ -975,7 +1019,7 @@ impl MysqlTokenStore {
         };
 
         tx.exec_drop(
-            "INSERT INTO token_reservations (user_id, id, purpose) VALUES (?, ?, ?)",
+            self.sql("INSERT INTO token_reservations (user_id, id, purpose) VALUES (?, ?, ?)"),
             (self.identity.clone(), &reservation_id, purpose_str),
         )
         .await
@@ -990,6 +1034,7 @@ impl MysqlTokenStore {
             let sql = format!(
                 "UPDATE token_outputs SET reservation_id = ? WHERE user_id = ? AND id IN ({placeholders})"
             );
+            let sql = self.sql(&sql);
             let mut params: Vec<Value> = Vec::with_capacity(selected_ids.len() + 2);
             params.push(Value::from(reservation_id.clone()));
             params.push(Value::from(self.identity.clone()));
@@ -1020,14 +1065,14 @@ impl MysqlTokenStore {
         let mut tx = conn.start_transaction(tx_opts()).await.map_err(map_err)?;
 
         tx.exec_drop(
-            "UPDATE token_outputs SET reservation_id = NULL WHERE user_id = ? AND reservation_id = ?",
+            self.sql("UPDATE token_outputs SET reservation_id = NULL WHERE user_id = ? AND reservation_id = ?"),
             (self.identity.clone(), id),
         )
         .await
         .map_err(map_err)?;
 
         tx.exec_drop(
-            "DELETE FROM token_reservations WHERE user_id = ? AND id = ?",
+            self.sql("DELETE FROM token_reservations WHERE user_id = ? AND id = ?"),
             (self.identity.clone(), id),
         )
         .await
@@ -1046,7 +1091,7 @@ impl MysqlTokenStore {
 
         let purpose: Option<String> = tx
             .exec_first(
-                "SELECT purpose FROM token_reservations WHERE user_id = ? AND id = ?",
+                self.sql("SELECT purpose FROM token_reservations WHERE user_id = ? AND id = ?"),
                 (self.identity.clone(), id),
             )
             .await
@@ -1062,7 +1107,7 @@ impl MysqlTokenStore {
 
         let reserved_output_ids: Vec<String> = tx
             .exec(
-                "SELECT id FROM token_outputs WHERE user_id = ? AND reservation_id = ?",
+                self.sql("SELECT id FROM token_outputs WHERE user_id = ? AND reservation_id = ?"),
                 (self.identity.clone(), id),
             )
             .await
@@ -1083,20 +1128,21 @@ impl MysqlTokenStore {
             }
             // Suppress duplicate-PK errors only.
             sql.push_str(" ON DUPLICATE KEY UPDATE output_id = output_id");
+            let sql = self.sql(&sql);
             tx.exec_drop(&sql, Params::Positional(params))
                 .await
                 .map_err(map_err)?;
         }
 
         tx.exec_drop(
-            "DELETE FROM token_outputs WHERE user_id = ? AND reservation_id = ?",
+            self.sql("DELETE FROM token_outputs WHERE user_id = ? AND reservation_id = ?"),
             (self.identity.clone(), id),
         )
         .await
         .map_err(map_err)?;
 
         tx.exec_drop(
-            "DELETE FROM token_reservations WHERE user_id = ? AND id = ?",
+            self.sql("DELETE FROM token_reservations WHERE user_id = ? AND id = ?"),
             (self.identity.clone(), id),
         )
         .await
@@ -1107,8 +1153,10 @@ impl MysqlTokenStore {
         // lazily.
         if is_swap {
             tx.exec_drop(
-                "INSERT INTO token_swap_status (user_id, last_completed_at) VALUES (?, NOW(6))
+                self.sql(
+                    "INSERT INTO token_swap_status (user_id, last_completed_at) VALUES (?, NOW(6))
                  ON DUPLICATE KEY UPDATE last_completed_at = VALUES(last_completed_at)",
+                ),
                 (self.identity.clone(),),
             )
             .await
@@ -1116,11 +1164,13 @@ impl MysqlTokenStore {
         }
 
         tx.exec_drop(
-            r"DELETE FROM token_metadata
+            self.sql(
+                r"DELETE FROM token_metadata
               WHERE user_id = ?
                 AND identifier NOT IN (
                   SELECT DISTINCT token_identifier FROM token_outputs WHERE user_id = ?
               )",
+            ),
             (self.identity.clone(), self.identity.clone()),
         )
         .await
@@ -1141,12 +1191,14 @@ impl MysqlTokenStore {
             // ON DUPLICATE KEY UPDATE id = id no-ops on the (user_id, id)
             // primary key conflict only — unlike INSERT IGNORE, FK / NOT NULL
             // / type errors still propagate.
-            r"INSERT INTO token_outputs
+            self.sql(
+                r"INSERT INTO token_outputs
                 (user_id, id, token_identifier, owner_public_key, revocation_commitment,
                  withdraw_bond_sats, withdraw_relative_block_locktime,
                  token_public_key, token_amount, prev_tx_hash, prev_tx_vout, added_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
               ON DUPLICATE KEY UPDATE id = id",
+            ),
             (
                 self.identity.clone(),
                 &output.output.id,
@@ -1173,7 +1225,8 @@ impl MysqlTokenStore {
         metadata: &TokenMetadata,
     ) -> Result<(), TokenOutputServiceError> {
         tx.exec_drop(
-            r"INSERT INTO token_metadata
+            self.sql(
+                r"INSERT INTO token_metadata
                 (user_id, identifier, issuer_public_key, name, ticker, decimals, max_supply,
                  is_freezable, creation_entity_public_key)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1185,6 +1238,7 @@ impl MysqlTokenStore {
                 max_supply = VALUES(max_supply),
                 is_freezable = VALUES(is_freezable),
                 creation_entity_public_key = VALUES(creation_entity_public_key)",
+            ),
             (
                 self.identity.clone(),
                 &metadata.identifier,
@@ -1210,7 +1264,8 @@ impl MysqlTokenStore {
         tx: &mut mysql_async::Transaction<'_>,
     ) -> Result<u64, TokenOutputServiceError> {
         tx.exec_drop(
-            r"UPDATE token_outputs SET reservation_id = NULL
+            self.sql(
+                r"UPDATE token_outputs SET reservation_id = NULL
               WHERE user_id = ?
                 AND reservation_id IN (
                     SELECT id FROM (
@@ -1219,6 +1274,7 @@ impl MysqlTokenStore {
                           AND created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
                     ) AS stale
                 )",
+            ),
             (
                 self.identity.clone(),
                 self.identity.clone(),
@@ -1230,8 +1286,10 @@ impl MysqlTokenStore {
 
         let mut result = tx
             .exec_iter(
-                "DELETE FROM token_reservations
+                self.sql(
+                    "DELETE FROM token_reservations
                  WHERE user_id = ? AND created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)",
+                ),
                 (self.identity.clone(), RESERVATION_TIMEOUT_SECS),
             )
             .await
@@ -1256,7 +1314,7 @@ impl MysqlTokenStore {
             .unwrap_or(refresh_timestamp);
 
         tx.exec_drop(
-            "DELETE FROM token_spent_outputs WHERE user_id = ? AND spent_at < ?",
+            self.sql("DELETE FROM token_spent_outputs WHERE user_id = ? AND spent_at < ?"),
             (self.identity.clone(), cleanup_cutoff.naive_utc()),
         )
         .await
@@ -1376,6 +1434,35 @@ fn build_placeholders(n: usize) -> String {
     s
 }
 
+fn token_outputs_create_table_sql(foreign_key_mode: MysqlForeignKeyMode) -> String {
+    let foreign_keys = if foreign_key_mode.creates_constraints() {
+        ",
+                        CONSTRAINT fk_token_outputs_metadata FOREIGN KEY (token_identifier)
+                            REFERENCES token_metadata(identifier),
+                        CONSTRAINT fk_token_outputs_reservation FOREIGN KEY (reservation_id)
+                            REFERENCES token_reservations(id) ON DELETE SET NULL"
+    } else {
+        ""
+    };
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS token_outputs (
+                        id VARCHAR(255) NOT NULL PRIMARY KEY,
+                        token_identifier VARCHAR(255) NOT NULL,
+                        owner_public_key VARCHAR(255) NOT NULL,
+                        revocation_commitment VARCHAR(255) NOT NULL,
+                        withdraw_bond_sats BIGINT NOT NULL,
+                        withdraw_relative_block_locktime BIGINT NOT NULL,
+                        token_public_key VARCHAR(255) NULL,
+                        token_amount VARCHAR(128) NOT NULL,
+                        prev_tx_hash VARCHAR(255) NOT NULL,
+                        prev_tx_vout INT NOT NULL,
+                        reservation_id VARCHAR(255) NULL,
+                        added_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6){foreign_keys}
+                    )"
+    )
+}
+
 /// Reads a column that the schema declares NOT NULL as an `Option<String>`
 /// first to avoid `mysql_async`'s panic-on-NULL behavior in `FromValue` for
 /// non-`Option` types, then surfaces both "column missing" and "column NULL"
@@ -1419,6 +1506,22 @@ pub async fn create_mysql_token_store_from_pool(
     Ok(Arc::new(MysqlTokenStore::from_pool(pool, identity).await?))
 }
 
+/// Creates a `MysqlTokenStore` from an existing connection pool with both
+/// foreign-key mode and table prefix options.
+///
+/// `identity` is the 33-byte secp256k1 pubkey scoping all reads and writes.
+pub async fn create_mysql_token_store_from_pool_with_options(
+    pool: Pool,
+    identity: &[u8],
+    foreign_key_mode: MysqlForeignKeyMode,
+    table_prefix: Option<&str>,
+) -> Result<Arc<dyn TokenOutputStore>, MysqlError> {
+    Ok(Arc::new(
+        MysqlTokenStore::from_pool_with_options(pool, identity, foreign_key_mode, table_prefix)
+            .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,6 +1537,88 @@ mod tests {
         0x1e, 0x1f, 0x20,
     ];
 
+    fn migration_sql_contains(migrations: &[Vec<Migration>], needle: &str) -> bool {
+        migrations
+            .iter()
+            .flatten()
+            .any(|migration| matches!(migration, Migration::Sql(sql) if sql.contains(needle)))
+    }
+
+    fn migration_adds_foreign_key(migrations: &[Vec<Migration>], name: &str, table: &str) -> bool {
+        migrations.iter().flatten().any(|migration| {
+            matches!(
+                migration,
+                Migration::AddForeignKey {
+                    name: fk_name,
+                    table: fk_table,
+                    ..
+                } if *fk_name == name && *fk_table == table
+            )
+        })
+    }
+
+    #[test]
+    fn enforced_foreign_key_mode_includes_token_constraints() {
+        let migrations = MysqlTokenStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        assert!(migration_sql_contains(
+            &migrations,
+            "fk_token_outputs_metadata FOREIGN KEY"
+        ));
+        assert!(migration_sql_contains(
+            &migrations,
+            "fk_token_outputs_reservation FOREIGN KEY"
+        ));
+        assert!(migration_adds_foreign_key(
+            &migrations,
+            "fk_token_outputs_metadata_user",
+            "token_outputs"
+        ));
+        assert!(migration_adds_foreign_key(
+            &migrations,
+            "fk_token_outputs_reservation_user",
+            "token_outputs"
+        ));
+    }
+
+    #[test]
+    fn disabled_foreign_key_mode_omits_token_constraints() {
+        let migrations = MysqlTokenStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Disabled);
+
+        assert!(!migration_sql_contains(&migrations, "FOREIGN KEY"));
+        assert!(migrations.iter().flatten().any(|migration| matches!(
+            migration,
+            Migration::DropForeignKey {
+                name: "fk_token_outputs_metadata",
+                table: "token_outputs"
+            }
+        )));
+        assert!(migrations.iter().flatten().any(|migration| matches!(
+            migration,
+            Migration::DropForeignKey {
+                name: "fk_token_outputs_reservation",
+                table: "token_outputs"
+            }
+        )));
+    }
+
+    #[test]
+    fn token_migrations_prefix_all_schema_objects() {
+        let migrations = MysqlTokenStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        crate::migrations::assert_migrations_prefix_schema_objects(&migrations, "breez_");
+    }
+
+    #[test]
+    fn token_migrations_schema_objects_are_known() {
+        let migrations = MysqlTokenStore::migrations(&TEST_IDENTITY, MysqlForeignKeyMode::Enforced);
+
+        crate::migrations::assert_migrations_schema_objects_known(
+            &migrations,
+            &[TOKEN_MIGRATIONS_TABLE],
+        );
+    }
+
     struct MysqlTokenStoreTestFixture {
         store: MysqlTokenStore,
         #[allow(dead_code)]
@@ -1442,6 +1627,10 @@ mod tests {
 
     impl MysqlTokenStoreTestFixture {
         async fn new() -> Self {
+            Self::new_with_foreign_key_mode(MysqlForeignKeyMode::default()).await
+        }
+
+        async fn new_with_foreign_key_mode(foreign_key_mode: MysqlForeignKeyMode) -> Self {
             let container = Mysql::default()
                 .start()
                 .await
@@ -1454,12 +1643,11 @@ mod tests {
 
             let connection_string = format!("mysql://root@127.0.0.1:{host_port}/test");
 
-            let store = MysqlTokenStore::from_config(
-                MysqlStorageConfig::with_defaults(connection_string),
-                &TEST_IDENTITY,
-            )
-            .await
-            .expect("Failed to create MysqlTokenStore");
+            let mut config = MysqlStorageConfig::with_defaults(connection_string);
+            config.foreign_key_mode = foreign_key_mode;
+            let store = MysqlTokenStore::from_config(config, &TEST_IDENTITY)
+                .await
+                .expect("Failed to create MysqlTokenStore");
 
             Self { store, container }
         }
@@ -1469,6 +1657,38 @@ mod tests {
     async fn test_set_tokens_outputs() {
         let fixture = MysqlTokenStoreTestFixture::new().await;
         shared_tests::test_set_tokens_outputs(&fixture.store).await;
+    }
+
+    #[tokio::test]
+    async fn test_new_with_disabled_foreign_key_mode() {
+        let fixture =
+            MysqlTokenStoreTestFixture::new_with_foreign_key_mode(MysqlForeignKeyMode::Disabled)
+                .await;
+
+        let mut conn = fixture
+            .store
+            .pool
+            .get_conn()
+            .await
+            .expect("Failed to get MySQL connection");
+        let count: Option<u64> = conn
+            .query_first(
+                "SELECT COUNT(*)
+                 FROM information_schema.table_constraints
+                 WHERE constraint_schema = DATABASE()
+                   AND constraint_type = 'FOREIGN KEY'
+                   AND table_name IN (
+                       'token_metadata',
+                       'token_outputs',
+                       'token_reservations',
+                       'token_spent_outputs',
+                       'token_swap_status'
+                   )",
+            )
+            .await
+            .expect("Failed to count token store foreign keys");
+
+        assert_eq!(count, Some(0));
     }
 
     #[tokio::test]

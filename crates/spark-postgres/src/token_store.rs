@@ -10,6 +10,7 @@ use std::sync::Arc;
 use deadpool_postgres::Pool;
 use macros::async_trait;
 use platform_utils::time::SystemTime;
+use spark_storage::TableNameRewriter;
 use spark_wallet::{
     GetTokenOutputsFilter, ReservationTarget, SelectionStrategy, TokenMetadata, TokenOutput,
     TokenOutputServiceError, TokenOutputStore, TokenOutputWithPrevOut, TokenOutputs,
@@ -22,8 +23,8 @@ use uuid::Uuid;
 use crate::advisory_lock::identity_lock_key;
 use crate::config::PostgresStorageConfig;
 use crate::error::PostgresError;
-use crate::migrations::run_migrations;
 use crate::pool::create_pool;
+use crate::query::{self as pg_query, PostgresQueryExt};
 
 /// Name of the schema migrations table for `PostgresTokenStore`.
 const TOKEN_MIGRATIONS_TABLE: &str = "token_schema_migrations";
@@ -49,6 +50,7 @@ const RESERVATION_TIMEOUT_SECS: f64 = 300.0; // 5 minutes
 /// can share one Postgres database without cross-pollinating token state.
 pub struct PostgresTokenStore {
     pool: Pool,
+    table_names: TableNameRewriter,
     /// 33-byte secp256k1 compressed pubkey identifying this tenant. All reads
     /// and writes are filtered by `user_id = self.identity`.
     identity: Vec<u8>,
@@ -56,6 +58,12 @@ pub struct PostgresTokenStore {
     /// Passed to the single-arg form `pg_advisory_xact_lock(bigint)` so two
     /// tenants don't serialize on each other's writes.
     lock_key: i64,
+}
+
+impl PostgresQueryExt for PostgresTokenStore {
+    fn table_names(&self) -> &TableNameRewriter {
+        &self.table_names
+    }
 }
 
 /// Builds the multi-tenant scoping migration for the token store. Adds
@@ -167,8 +175,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Skip if swap is active or completed during this refresh
         let (has_active_swap, swap_completed_during_refresh): (bool, bool) = {
-            let row = tx
+            let row = self
                 .query_one(
+                    &tx,
                     r"
                     SELECT
                         EXISTS(
@@ -203,8 +212,9 @@ impl TokenOutputStore for PostgresTokenStore {
         // Older spent markers are ignored - if the refresh started after the spend,
         // operators had time to process it.
         let spent_ids: HashSet<String> = {
-            let rows = tx
+            let rows = self
                 .query(
+                    &tx,
                     "SELECT output_id FROM token_spent_outputs \
                      WHERE user_id = $1 AND spent_at >= $2",
                     &[&self.identity, &refresh_timestamp],
@@ -216,7 +226,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Delete non-reserved outputs added BEFORE the refresh started.
         // Outputs added after will be preserved (they were inserted while refresh was in progress).
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "DELETE FROM token_outputs \
              WHERE user_id = $1 AND reservation_id IS NULL AND added_at < $2",
             &[&self.identity, &refresh_timestamp],
@@ -231,8 +243,9 @@ impl TokenOutputStore for PostgresTokenStore {
             .collect();
 
         // Reconcile reservations: find reserved outputs that no longer exist
-        let reserved_rows = tx
+        let reserved_rows = self
             .query(
+                &tx,
                 r"SELECT r.id, o.id AS output_id
                   FROM token_reservations r
                   JOIN token_outputs o
@@ -276,14 +289,18 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Delete outputs whose reservations are being removed entirely
         if !reservations_to_delete.is_empty() {
-            tx.execute(
+            pg_query::execute(
+                &self.table_names,
+                &tx,
                 "DELETE FROM token_outputs WHERE user_id = $1 AND reservation_id = ANY($2)",
                 &[&self.identity, &reservations_to_delete],
             )
             .await
             .map_err(map_err)?;
 
-            tx.execute(
+            pg_query::execute(
+                &self.table_names,
+                &tx,
                 "DELETE FROM token_reservations WHERE user_id = $1 AND id = ANY($2)",
                 &[&self.identity, &reservations_to_delete],
             )
@@ -293,7 +310,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Delete individual reserved outputs that no longer exist
         if !outputs_to_remove_from_reservation.is_empty() {
-            tx.execute(
+            pg_query::execute(
+                &self.table_names,
+                &tx,
                 "DELETE FROM token_outputs WHERE user_id = $1 AND id = ANY($2)",
                 &[&self.identity, &outputs_to_remove_from_reservation],
             )
@@ -301,8 +320,9 @@ impl TokenOutputStore for PostgresTokenStore {
             .map_err(map_err)?;
 
             // Check if any reservations are now empty after removing individual outputs
-            let empty_reservations = tx
+            let empty_reservations = self
                 .query(
+                    &tx,
                     r"SELECT r.id FROM token_reservations r
                       LEFT JOIN token_outputs o
                         ON o.reservation_id = r.id AND o.user_id = r.user_id
@@ -314,7 +334,9 @@ impl TokenOutputStore for PostgresTokenStore {
             let empty_ids: Vec<String> =
                 empty_reservations.iter().map(|row| row.get("id")).collect();
             if !empty_ids.is_empty() {
-                tx.execute(
+                pg_query::execute(
+                    &self.table_names,
+                    &tx,
                     "DELETE FROM token_reservations WHERE user_id = $1 AND id = ANY($2)",
                     &[&self.identity, &empty_ids],
                 )
@@ -325,8 +347,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Collect IDs of currently reserved outputs (that survived reconciliation)
         let reserved_output_ids: HashSet<String> = {
-            let rows = tx
+            let rows = self
                 .query(
+                    &tx,
                     "SELECT id FROM token_outputs \
                      WHERE user_id = $1 AND reservation_id IS NOT NULL",
                     &[&self.identity],
@@ -337,7 +360,9 @@ impl TokenOutputStore for PostgresTokenStore {
         };
 
         // Delete metadata not referenced by any remaining outputs (per-tenant).
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             r"DELETE FROM token_metadata
               WHERE user_id = $1
                 AND identifier NOT IN (
@@ -379,8 +404,9 @@ impl TokenOutputStore for PostgresTokenStore {
         &self,
     ) -> Result<Vec<(TokenMetadata, u128)>, TokenOutputServiceError> {
         let client = self.pool.get().await.map_err(map_err)?;
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
                          m.max_supply, m.is_freezable, m.creation_entity_public_key,
                          COALESCE(SUM(
@@ -417,8 +443,9 @@ impl TokenOutputStore for PostgresTokenStore {
     ) -> Result<Vec<TokenOutputsPerStatus>, TokenOutputServiceError> {
         let client = self.pool.get().await.map_err(map_err)?;
 
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 r"SELECT m.identifier, m.issuer_public_key, m.name, m.ticker, m.decimals,
                          m.max_supply, m.is_freezable, m.creation_entity_public_key,
                          o.id AS output_id, o.owner_public_key, o.revocation_commitment,
@@ -506,8 +533,8 @@ impl TokenOutputStore for PostgresTokenStore {
               ORDER BY o.token_amount::NUMERIC ASC"
         );
 
-        let rows = client
-            .query(&query, &[&param, &self.identity])
+        let rows = self
+            .query(&client, &query, &[&param, &self.identity])
             .await
             .map_err(map_err)?;
 
@@ -562,7 +589,9 @@ impl TokenOutputStore for PostgresTokenStore {
             .map(|o| o.output.id.clone())
             .collect();
         if !output_ids.is_empty() {
-            tx.execute(
+            pg_query::execute(
+                &self.table_names,
+                &tx,
                 "DELETE FROM token_spent_outputs WHERE user_id = $1 AND output_id = ANY($2)",
                 &[&self.identity, &output_ids],
             )
@@ -617,8 +646,9 @@ impl TokenOutputStore for PostgresTokenStore {
         self.acquire_write_lock(&tx).await?;
 
         // Get metadata
-        let metadata_row = tx
+        let metadata_row = self
             .query_opt(
+                &tx,
                 "SELECT * FROM token_metadata WHERE user_id = $1 AND identifier = $2",
                 &[&self.identity, &token_identifier],
             )
@@ -632,8 +662,9 @@ impl TokenOutputStore for PostgresTokenStore {
         let metadata = Self::metadata_from_row(&metadata_row)?;
 
         // Get available (non-reserved) outputs
-        let rows = tx
+        let rows = self
             .query(
+                &tx,
                 r"SELECT o.id AS output_id, o.owner_public_key, o.revocation_commitment,
                          o.withdraw_bond_sats, o.withdraw_relative_block_locktime,
                          o.token_public_key, o.token_amount, o.prev_tx_hash, o.prev_tx_vout,
@@ -711,7 +742,9 @@ impl TokenOutputStore for PostgresTokenStore {
             TokenReservationPurpose::Swap => "Swap",
         };
 
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "INSERT INTO token_reservations (user_id, id, purpose) VALUES ($1, $2, $3)",
             &[&self.identity, &reservation_id, &purpose_str],
         )
@@ -723,7 +756,9 @@ impl TokenOutputStore for PostgresTokenStore {
             .iter()
             .map(|o| o.output.id.clone())
             .collect();
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "UPDATE token_outputs SET reservation_id = $1 \
              WHERE user_id = $3 AND id = ANY($2)",
             &[&reservation_id, &selected_ids, &self.identity],
@@ -754,7 +789,9 @@ impl TokenOutputStore for PostgresTokenStore {
         // Clear reservation_id from outputs first — the composite FK uses NO
         // ACTION (column-list SET NULL is PG15+ and a whole-row SET NULL would
         // null user_id, which is NOT NULL).
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "UPDATE token_outputs SET reservation_id = NULL \
              WHERE user_id = $1 AND reservation_id = $2",
             &[&self.identity, id],
@@ -763,7 +800,9 @@ impl TokenOutputStore for PostgresTokenStore {
         .map_err(map_err)?;
 
         // Delete the reservation
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "DELETE FROM token_reservations WHERE user_id = $1 AND id = $2",
             &[&self.identity, id],
         )
@@ -789,8 +828,9 @@ impl TokenOutputStore for PostgresTokenStore {
         self.acquire_write_lock(&tx).await?;
 
         // Get reservation purpose and reserved output IDs
-        let reservation_row = tx
+        let reservation_row = self
             .query_opt(
+                &tx,
                 "SELECT purpose FROM token_reservations WHERE user_id = $1 AND id = $2",
                 &[&self.identity, id],
             )
@@ -806,8 +846,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Get reserved output IDs and mark them as spent
         let reserved_output_ids: Vec<String> = {
-            let rows = tx
+            let rows = self
                 .query(
+                    &tx,
                     "SELECT id FROM token_outputs WHERE user_id = $1 AND reservation_id = $2",
                     &[&self.identity, id],
                 )
@@ -818,7 +859,9 @@ impl TokenOutputStore for PostgresTokenStore {
 
         // Batch insert spent output markers
         if !reserved_output_ids.is_empty() {
-            tx.execute(
+            pg_query::execute(
+                &self.table_names,
+                &tx,
                 r"INSERT INTO token_spent_outputs (user_id, output_id)
                   SELECT $2, output_id FROM UNNEST($1::text[]) AS t(output_id)
                   ON CONFLICT DO NOTHING",
@@ -829,7 +872,9 @@ impl TokenOutputStore for PostgresTokenStore {
         }
 
         // Delete reserved outputs
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "DELETE FROM token_outputs WHERE user_id = $1 AND reservation_id = $2",
             &[&self.identity, id],
         )
@@ -837,7 +882,9 @@ impl TokenOutputStore for PostgresTokenStore {
         .map_err(map_err)?;
 
         // Delete the reservation
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             "DELETE FROM token_reservations WHERE user_id = $1 AND id = $2",
             &[&self.identity, id],
         )
@@ -847,7 +894,8 @@ impl TokenOutputStore for PostgresTokenStore {
         // If this was a swap reservation, update last_completed_at. UPSERT so a
         // tenant that joined after migration 2 (and thus has no row) gets one.
         if is_swap {
-            tx.execute(
+            pg_query::execute(&self.table_names,
+                &tx,
                 "INSERT INTO token_swap_status (user_id, last_completed_at) \
                  VALUES ($1, NOW()) \
                  ON CONFLICT (user_id) DO UPDATE SET last_completed_at = EXCLUDED.last_completed_at",
@@ -858,7 +906,9 @@ impl TokenOutputStore for PostgresTokenStore {
         }
 
         // Clean up any orphaned metadata (per-tenant).
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            &tx,
             r"DELETE FROM token_metadata
               WHERE user_id = $1
                 AND identifier NOT IN (
@@ -896,8 +946,10 @@ impl PostgresTokenStore {
         config: PostgresStorageConfig,
         identity: &[u8],
     ) -> Result<Self, PostgresError> {
+        let table_names = TableNameRewriter::new(config.table_prefix.as_deref())
+            .map_err(|e| PostgresError::Initialization(e.to_string()))?;
         let pool = create_pool(&config)?;
-        Self::init(pool, identity).await
+        Self::init(pool, identity, table_names).await
     }
 
     /// Creates a new `PostgresTokenStore` from an existing connection pool.
@@ -905,13 +957,30 @@ impl PostgresTokenStore {
     /// This reuses the provided pool and runs token store migrations.
     /// Useful when sharing a pool with other components (e.g., `PostgresStorage`).
     pub async fn from_pool(pool: Pool, identity: &[u8]) -> Result<Self, PostgresError> {
-        Self::init(pool, identity).await
+        Self::from_pool_with_table_prefix(pool, identity, None).await
+    }
+
+    /// Creates a new `PostgresTokenStore` from an existing connection pool
+    /// with an optional table prefix.
+    pub async fn from_pool_with_table_prefix(
+        pool: Pool,
+        identity: &[u8],
+        table_prefix: Option<&str>,
+    ) -> Result<Self, PostgresError> {
+        let table_names = TableNameRewriter::new(table_prefix)
+            .map_err(|e| PostgresError::Initialization(e.to_string()))?;
+        Self::init(pool, identity, table_names).await
     }
 
     /// Shared initialization logic for both constructors.
-    async fn init(pool: Pool, identity: &[u8]) -> Result<Self, PostgresError> {
+    async fn init(
+        pool: Pool,
+        identity: &[u8],
+        table_names: TableNameRewriter,
+    ) -> Result<Self, PostgresError> {
         let store = Self {
             pool,
+            table_names,
             identity: identity.to_vec(),
             lock_key: identity_lock_key(TOKEN_STORE_LOCK_PREFIX, identity),
         };
@@ -921,10 +990,11 @@ impl PostgresTokenStore {
 
     /// Runs database migrations for token store tables.
     async fn migrate(&self) -> Result<(), PostgresError> {
-        run_migrations(
+        crate::migrations::run_migrations_with_table_names(
             &self.pool,
             TOKEN_MIGRATIONS_TABLE,
             &Self::migrations(&self.identity),
+            &self.table_names,
         )
         .await
     }
@@ -1001,7 +1071,7 @@ impl PostgresTokenStore {
     /// block each other. Same-tenant writes still serialize on the same lock.
     async fn acquire_write_lock(
         &self,
-        tx: &tokio_postgres::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
     ) -> Result<(), TokenOutputServiceError> {
         tx.execute("SELECT pg_advisory_xact_lock($1)", &[&self.lock_key])
             .await
@@ -1013,11 +1083,13 @@ impl PostgresTokenStore {
     #[allow(clippy::cast_possible_wrap)]
     async fn insert_single_output(
         &self,
-        tx: &tokio_postgres::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
         token_identifier: &str,
         output: &TokenOutputWithPrevOut,
     ) -> Result<(), TokenOutputServiceError> {
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            tx,
             r"INSERT INTO token_outputs
                 (user_id, id, token_identifier, owner_public_key, revocation_commitment,
                  withdraw_bond_sats, withdraw_relative_block_locktime,
@@ -1047,10 +1119,12 @@ impl PostgresTokenStore {
     #[allow(clippy::cast_possible_wrap)]
     async fn upsert_metadata(
         &self,
-        tx: &tokio_postgres::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
         metadata: &TokenMetadata,
     ) -> Result<(), TokenOutputServiceError> {
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            tx,
             r"INSERT INTO token_metadata
                 (user_id, identifier, issuer_public_key, name, ticker, decimals, max_supply,
                  is_freezable, creation_entity_public_key)
@@ -1088,10 +1162,12 @@ impl PostgresTokenStore {
     /// would null `user_id` (NOT NULL).
     async fn cleanup_stale_reservations(
         &self,
-        tx: &tokio_postgres::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
     ) -> Result<u64, TokenOutputServiceError> {
         // Release outputs still pointing at any soon-to-be-deleted reservation.
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            tx,
             r"UPDATE token_outputs SET reservation_id = NULL
               WHERE user_id = $2
                 AND reservation_id IN (
@@ -1104,8 +1180,9 @@ impl PostgresTokenStore {
         .await
         .map_err(map_err)?;
 
-        let result = tx
+        let result = self
             .execute(
+                tx,
                 r"DELETE FROM token_reservations
                   WHERE user_id = $2
                     AND created_at < NOW() - make_interval(secs => $1)",
@@ -1124,7 +1201,7 @@ impl PostgresTokenStore {
     /// Cleans up spent markers older than the cleanup threshold relative to refresh timestamp.
     async fn cleanup_spent_markers(
         &self,
-        tx: &tokio_postgres::Transaction<'_>,
+        tx: &deadpool_postgres::Transaction<'_>,
         refresh_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), TokenOutputServiceError> {
         let threshold = chrono::Duration::milliseconds(SPENT_MARKER_CLEANUP_THRESHOLD_MS);
@@ -1132,7 +1209,9 @@ impl PostgresTokenStore {
             .checked_sub_signed(threshold)
             .unwrap_or(refresh_timestamp);
 
-        tx.execute(
+        pg_query::execute(
+            &self.table_names,
+            tx,
             "DELETE FROM token_spent_outputs WHERE user_id = $2 AND spent_at < $1",
             &[&cleanup_cutoff, &self.identity],
         )
@@ -1249,6 +1328,20 @@ pub async fn create_postgres_token_store_from_pool(
     ))
 }
 
+/// Creates a `PostgresTokenStore` instance from an existing connection pool
+/// with an optional table prefix.
+///
+/// * `identity` - 33-byte secp256k1 pubkey scoping all reads and writes
+pub async fn create_postgres_token_store_from_pool_with_table_prefix(
+    pool: Pool,
+    identity: &[u8],
+    table_prefix: Option<&str>,
+) -> Result<Arc<dyn TokenOutputStore>, PostgresError> {
+    Ok(Arc::new(
+        PostgresTokenStore::from_pool_with_table_prefix(pool, identity, table_prefix).await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,6 +1356,23 @@ mod tests {
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
         0x1e, 0x1f, 0x20,
     ];
+
+    #[test]
+    fn token_migrations_prefix_all_schema_objects() {
+        let migrations = PostgresTokenStore::migrations(&TEST_IDENTITY);
+
+        crate::migrations::assert_migrations_prefix_schema_objects(&migrations, "breez_");
+    }
+
+    #[test]
+    fn token_migrations_schema_objects_are_known() {
+        let migrations = PostgresTokenStore::migrations(&TEST_IDENTITY);
+
+        crate::migrations::assert_migrations_schema_objects_known(
+            &migrations,
+            &[TOKEN_MIGRATIONS_TABLE],
+        );
+    }
 
     /// Helper struct that holds the container and store together.
     /// The container must be kept alive for the duration of the test.

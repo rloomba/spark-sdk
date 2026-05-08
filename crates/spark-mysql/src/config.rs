@@ -4,6 +4,22 @@
 /// Mirrors the deadpool default of `num_cpus * 4` reasonably without depending on `num_cpus`.
 const DEFAULT_MAX_POOL_SIZE: u32 = 32;
 
+/// Controls whether `MySQL` migrations create database-enforced foreign keys.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MysqlForeignKeyMode {
+    /// Create foreign-key constraints in the managed schema.
+    #[default]
+    Enforced,
+    /// Omit foreign-key constraints from the managed schema.
+    Disabled,
+}
+
+impl MysqlForeignKeyMode {
+    pub(crate) fn creates_constraints(self) -> bool {
+        matches!(self, Self::Enforced)
+    }
+}
+
 /// Configuration for `MySQL` storage connection pool.
 #[derive(Clone, Debug)]
 pub struct MysqlStorageConfig {
@@ -24,6 +40,18 @@ pub struct MysqlStorageConfig {
     /// Only used when the connection string requests TLS (`ssl-mode=verify_ca`,
     /// `ssl-mode=verify_identity`).
     pub root_ca_pem: Option<String>,
+
+    /// Whether migrations should create database-enforced foreign keys.
+    ///
+    /// Use `Disabled` for environments that manage relationships in application
+    /// code and require schema changes without foreign-key constraints.
+    pub foreign_key_mode: MysqlForeignKeyMode,
+
+    /// Optional prefix applied to all SDK-owned `MySQL` table names.
+    ///
+    /// This allows embedding the SDK tables in a shared application schema
+    /// without introducing generic table names such as `payments`.
+    pub table_prefix: Option<String>,
 }
 
 impl MysqlStorageConfig {
@@ -35,6 +63,8 @@ impl MysqlStorageConfig {
             max_pool_size: DEFAULT_MAX_POOL_SIZE,
             recycle_timeout_secs: None,
             root_ca_pem: None,
+            foreign_key_mode: MysqlForeignKeyMode::default(),
+            table_prefix: None,
         }
     }
 }

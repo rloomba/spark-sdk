@@ -29,6 +29,9 @@
 //! Migration::CreateIndex { name: "idx_tree_leaves_slim", table: "tree_leaves",
 //!     columns: "(status, is_missing_from_operators, reservation_id, value)" }
 //! Migration::DropColumn { table: "lnurl_receive_metadata", column: "preimage" }
+//! Migration::AddForeignKey { name: "fk_tree_leaves_reservation", table: "tree_leaves",
+//!     columns: "(reservation_id)", referenced_table: "tree_reservations",
+//!     referenced_columns: "(id)" }
 //! ```
 //!
 //! The runner emits guarded SQL for each variant: a pre-flight check against
@@ -47,6 +50,7 @@
 
 use mysql_async::Pool;
 use mysql_async::prelude::*;
+use spark_storage::TableNameRewriter;
 
 use crate::error::MysqlError;
 use crate::pool::map_db_error;
@@ -116,6 +120,20 @@ pub enum Migration {
         table: &'static str,
     },
 
+    /// `ALTER TABLE <table> ADD CONSTRAINT <name> FOREIGN KEY <columns>
+    /// REFERENCES <referenced_table><referenced_columns>`, guarded by an
+    /// `information_schema.table_constraints` lookup so re-running after
+    /// partially applied DDL is a no-op.
+    AddForeignKey {
+        name: &'static str,
+        table: &'static str,
+        /// Parenthesised column list, e.g. `"(user_id, reservation_id)"`.
+        columns: &'static str,
+        referenced_table: &'static str,
+        /// Parenthesised referenced column list, e.g. `"(user_id, id)"`.
+        referenced_columns: &'static str,
+    },
+
     /// `ALTER TABLE <table> DROP PRIMARY KEY`, guarded by an
     /// `information_schema.table_constraints` lookup so re-running an already
     /// applied migration is a no-op. Needed when rewriting PKs to lead with
@@ -125,9 +143,9 @@ pub enum Migration {
 }
 
 impl Migration {
-    /// Convenience constructor for the common case of a `&'static str` literal.
-    pub fn sql(s: &str) -> Self {
-        Self::Sql(s.to_string())
+    /// Convenience constructor for SQL literals and generated statements.
+    pub fn sql(s: impl Into<String>) -> Self {
+        Self::Sql(s.into())
     }
 }
 
@@ -149,11 +167,40 @@ pub async fn run_migrations(
     migrations_table: &str,
     migrations: &[Vec<Migration>],
 ) -> Result<(), MysqlError> {
+    run_migrations_with_table_names(
+        pool,
+        migrations_table,
+        migrations,
+        &TableNameRewriter::unprefixed(),
+    )
+    .await
+}
+
+/// Runs database migrations with an optional table prefix applied to all
+/// SDK-owned table names.
+pub async fn run_migrations_with_table_prefix(
+    pool: &Pool,
+    migrations_table: &str,
+    migrations: &[Vec<Migration>],
+    table_prefix: Option<&str>,
+) -> Result<(), MysqlError> {
+    let table_names = TableNameRewriter::new(table_prefix)
+        .map_err(|e| MysqlError::Initialization(e.to_string()))?;
+    run_migrations_with_table_names(pool, migrations_table, migrations, &table_names).await
+}
+
+pub(crate) async fn run_migrations_with_table_names(
+    pool: &Pool,
+    migrations_table: &str,
+    migrations: &[Vec<Migration>],
+    table_names: &TableNameRewriter,
+) -> Result<(), MysqlError> {
     let mut conn = pool
         .get_conn()
         .await
         .map_err(|e| MysqlError::Connection(e.to_string()))?;
 
+    let migrations_table = table_names.identifier(migrations_table);
     let lock_name = format!("migration_lock_{migrations_table}");
 
     // Acquire GET_LOCK on the session connection. Returns 1 if granted, 0 on
@@ -174,7 +221,7 @@ pub async fn run_migrations(
         )));
     }
 
-    let result = run_migrations_inner(&mut conn, migrations_table, migrations).await;
+    let result = run_migrations_inner(&mut conn, &migrations_table, migrations, table_names).await;
 
     // Always release the lock, even on failure. Ignore release errors so we
     // don't mask the underlying migration error.
@@ -188,6 +235,7 @@ async fn run_migrations_inner(
     conn: &mut mysql_async::Conn,
     migrations_table: &str,
     migrations: &[Vec<Migration>],
+    table_names: &TableNameRewriter,
 ) -> Result<(), MysqlError> {
     // Begin transaction. Migration table creation lives inside the transaction
     // for parity with the postgres impl, but note that DDL implicitly commits
@@ -222,7 +270,7 @@ async fn run_migrations_inner(
         let version = i32::try_from(i + 1).unwrap_or(i32::MAX);
         if version > current_version {
             for step in migration {
-                run_step(conn, version, step).await?;
+                run_step(conn, version, step, table_names).await?;
             }
             let insert_sql = format!("INSERT INTO `{migrations_table}` (version) VALUES (?)");
             conn.exec_drop(&insert_sql, (version,))
@@ -243,19 +291,23 @@ async fn run_step(
     conn: &mut mysql_async::Conn,
     version: i32,
     step: &Migration,
+    table_names: &TableNameRewriter,
 ) -> Result<(), MysqlError> {
     match step {
-        Migration::Sql(sql) => conn
-            .query_drop(sql.as_str())
-            .await
-            .map_err(|e| MysqlError::Database(format!("Migration {version} failed: {e}"))),
+        Migration::Sql(sql) => {
+            let sql = table_names.sql(sql);
+            conn.query_drop(sql.as_ref())
+                .await
+                .map_err(|e| MysqlError::Database(format!("Migration {version} failed: {e}")))
+        }
 
         Migration::AddColumn {
             table,
             column,
             definition,
         } => {
-            if column_exists(conn, table, column).await? {
+            let table = table_names.identifier(table);
+            if column_exists(conn, &table, column).await? {
                 return Ok(());
             }
             let sql = format!("ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}");
@@ -267,7 +319,8 @@ async fn run_step(
         }
 
         Migration::DropColumn { table, column } => {
-            if !column_exists(conn, table, column).await? {
+            let table = table_names.identifier(table);
+            if !column_exists(conn, &table, column).await? {
                 return Ok(());
             }
             let sql = format!("ALTER TABLE `{table}` DROP COLUMN `{column}`");
@@ -283,7 +336,9 @@ async fn run_step(
             table,
             columns,
         } => {
-            if index_exists(conn, table, name).await? {
+            let table = table_names.identifier(table);
+            let name = table_names.identifier(name);
+            if index_exists(conn, &table, &name).await? {
                 return Ok(());
             }
             let sql = format!("CREATE INDEX `{name}` ON `{table}` {columns}");
@@ -295,7 +350,9 @@ async fn run_step(
         }
 
         Migration::DropIndex { name, table } => {
-            if !index_exists(conn, table, name).await? {
+            let table = table_names.identifier(table);
+            let name = table_names.identifier(name);
+            if !index_exists(conn, &table, &name).await? {
                 return Ok(());
             }
             let sql = format!("DROP INDEX `{name}` ON `{table}`");
@@ -307,7 +364,9 @@ async fn run_step(
         }
 
         Migration::DropForeignKey { name, table } => {
-            if !foreign_key_exists(conn, table, name).await? {
+            let table = table_names.identifier(table);
+            let name = table_names.identifier(name);
+            if !foreign_key_exists(conn, &table, &name).await? {
                 return Ok(());
             }
             let sql = format!("ALTER TABLE `{table}` DROP FOREIGN KEY `{name}`");
@@ -318,8 +377,32 @@ async fn run_step(
             })
         }
 
+        Migration::AddForeignKey {
+            name,
+            table,
+            columns,
+            referenced_table,
+            referenced_columns,
+        } => {
+            let table = table_names.identifier(table);
+            let name = table_names.identifier(name);
+            if foreign_key_exists(conn, &table, &name).await? {
+                return Ok(());
+            }
+            let referenced_table = table_names.identifier(referenced_table);
+            let sql = format!(
+                "ALTER TABLE `{table}` ADD CONSTRAINT `{name}` FOREIGN KEY {columns} REFERENCES `{referenced_table}`{referenced_columns}"
+            );
+            conn.query_drop(&sql).await.map_err(|e| {
+                MysqlError::Database(format!(
+                    "Migration {version} ADD FOREIGN KEY {name} on {table} failed: {e}"
+                ))
+            })
+        }
+
         Migration::DropPrimaryKey { table } => {
-            if !primary_key_exists(conn, table).await? {
+            let table = table_names.identifier(table);
+            if !primary_key_exists(conn, &table).await? {
                 return Ok(());
             }
             let sql = format!("ALTER TABLE `{table}` DROP PRIMARY KEY");
@@ -408,6 +491,229 @@ async fn primary_key_exists(conn: &mut mysql_async::Conn, table: &str) -> Result
     Ok(count.unwrap_or(0) > 0)
 }
 
+/// Asserts every SDK schema object referenced by migrations is represented in
+/// the shared storage identifier allowlist.
+#[doc(hidden)]
+pub fn assert_migrations_schema_objects_known(
+    migrations: &[Vec<Migration>],
+    extra_identifiers: &[&str],
+) {
+    let mut identifiers = std::collections::BTreeSet::new();
+    identifiers.extend(extra_identifiers.iter().copied().map(str::to_string));
+
+    for step in migrations.iter().flatten() {
+        match step {
+            Migration::Sql(sql) => collect_sql_schema_identifiers(sql, &mut identifiers),
+            Migration::AddColumn { table, .. }
+            | Migration::DropColumn { table, .. }
+            | Migration::DropIndex { table, .. }
+            | Migration::DropForeignKey { table, .. }
+            | Migration::DropPrimaryKey { table } => {
+                identifiers.insert((*table).to_string());
+            }
+            Migration::CreateIndex { name, table, .. } => {
+                identifiers.insert((*name).to_string());
+                identifiers.insert((*table).to_string());
+            }
+            Migration::AddForeignKey {
+                name,
+                table,
+                referenced_table,
+                ..
+            } => {
+                identifiers.insert((*name).to_string());
+                identifiers.insert((*table).to_string());
+                identifiers.insert((*referenced_table).to_string());
+            }
+        }
+    }
+
+    let unknown: Vec<_> = identifiers
+        .into_iter()
+        .filter(|identifier| !spark_storage::is_storage_identifier(identifier))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "migration schema identifiers missing from STORAGE_IDENTIFIERS: {unknown:?}"
+    );
+}
+
+fn collect_sql_schema_identifiers(sql: &str, identifiers: &mut std::collections::BTreeSet<String>) {
+    for keyword in [
+        "CREATE TABLE",
+        "ALTER TABLE",
+        "UPDATE",
+        "DELETE FROM",
+        "INSERT INTO",
+        "REFERENCES",
+        "CONSTRAINT",
+    ] {
+        identifiers.extend(identifiers_after_keyword(sql, keyword));
+    }
+
+    for index_pos in keyword_positions(sql, "CREATE INDEX") {
+        if let Some(index_name) = identifier_after(sql, index_pos + "CREATE INDEX".len()) {
+            identifiers.insert(index_name);
+        }
+
+        let upper_tail = sql[index_pos..].to_ascii_uppercase();
+        if let Some(on_offset) = upper_tail.find(" ON ")
+            && let Some(table_name) = identifier_after(sql, index_pos + on_offset + " ON ".len())
+        {
+            identifiers.insert(table_name);
+        }
+    }
+
+    identifiers.extend(identifiers_after_keyword(sql, "DROP INDEX"));
+}
+
+#[cfg(test)]
+pub(crate) fn assert_migrations_prefix_schema_objects(migrations: &[Vec<Migration>], prefix: &str) {
+    let table_names = TableNameRewriter::new(Some(prefix)).expect("valid test prefix");
+
+    for step in migrations.iter().flatten() {
+        match step {
+            Migration::Sql(sql) => {
+                let sql = table_names.sql(sql);
+                assert_sql_schema_identifiers_prefixed(sql.as_ref(), prefix);
+            }
+            Migration::AddColumn { table, .. }
+            | Migration::DropColumn { table, .. }
+            | Migration::DropIndex { table, .. }
+            | Migration::DropForeignKey { table, .. }
+            | Migration::DropPrimaryKey { table } => {
+                assert_prefixed_schema_identifier(&table_names.identifier(table), prefix);
+            }
+            Migration::CreateIndex { name, table, .. } => {
+                assert_prefixed_schema_identifier(&table_names.identifier(name), prefix);
+                assert_prefixed_schema_identifier(&table_names.identifier(table), prefix);
+            }
+            Migration::AddForeignKey {
+                name,
+                table,
+                referenced_table,
+                ..
+            } => {
+                assert_prefixed_schema_identifier(&table_names.identifier(name), prefix);
+                assert_prefixed_schema_identifier(&table_names.identifier(table), prefix);
+                assert_prefixed_schema_identifier(
+                    &table_names.identifier(referenced_table),
+                    prefix,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn assert_sql_schema_identifiers_prefixed(sql: &str, prefix: &str) {
+    for keyword in [
+        "CREATE TABLE",
+        "ALTER TABLE",
+        "UPDATE",
+        "DELETE FROM",
+        "INSERT INTO",
+        "REFERENCES",
+        "CONSTRAINT",
+    ] {
+        for identifier in identifiers_after_keyword(sql, keyword) {
+            assert_prefixed_schema_identifier(&identifier, prefix);
+        }
+    }
+
+    for index_pos in keyword_positions(sql, "CREATE INDEX") {
+        let Some(index_name) = identifier_after(sql, index_pos + "CREATE INDEX".len()) else {
+            continue;
+        };
+        assert_prefixed_schema_identifier(&index_name, prefix);
+
+        let upper_tail = sql[index_pos..].to_ascii_uppercase();
+        if let Some(on_offset) = upper_tail.find(" ON ")
+            && let Some(table_name) = identifier_after(sql, index_pos + on_offset + " ON ".len())
+        {
+            assert_prefixed_schema_identifier(&table_name, prefix);
+        }
+    }
+
+    for identifier in identifiers_after_keyword(sql, "DROP INDEX") {
+        assert_prefixed_schema_identifier(&identifier, prefix);
+    }
+}
+
+fn identifiers_after_keyword(sql: &str, keyword: &str) -> Vec<String> {
+    keyword_positions(sql, keyword)
+        .into_iter()
+        .filter(|pos| keyword != "UPDATE" || is_statement_start(sql, *pos))
+        .filter_map(|pos| identifier_after(sql, pos + keyword.len()))
+        .collect()
+}
+
+fn keyword_positions(sql: &str, keyword: &str) -> Vec<usize> {
+    let upper = sql.to_ascii_uppercase();
+    let mut positions = Vec::new();
+    let mut offset = 0;
+    while let Some(pos) = upper[offset..].find(keyword) {
+        let absolute = offset + pos;
+        positions.push(absolute);
+        offset = absolute + keyword.len();
+    }
+    positions
+}
+
+fn is_statement_start(sql: &str, pos: usize) -> bool {
+    sql[..pos].chars().all(|c| c.is_whitespace() || c == ';')
+}
+
+fn identifier_after(sql: &str, mut offset: usize) -> Option<String> {
+    let bytes = sql.as_bytes();
+    while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+        offset += 1;
+    }
+
+    for optional in ["IF NOT EXISTS", "IF EXISTS"] {
+        if sql[offset..].to_ascii_uppercase().starts_with(optional) {
+            offset += optional.len();
+            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+                offset += 1;
+            }
+        }
+    }
+
+    if offset >= bytes.len() {
+        return None;
+    }
+
+    let quote = match bytes[offset] {
+        b'`' | b'"' => {
+            offset += 1;
+            Some(bytes[offset - 1])
+        }
+        _ => None,
+    };
+
+    let start = offset;
+    while offset < bytes.len() {
+        let b = bytes[offset];
+        if Some(b) == quote {
+            break;
+        }
+        if quote.is_none() && (b.is_ascii_whitespace() || matches!(b, b'(' | b',' | b';')) {
+            break;
+        }
+        offset += 1;
+    }
+
+    (offset > start).then(|| sql[start..offset].to_string())
+}
+
+#[cfg(test)]
+fn assert_prefixed_schema_identifier(identifier: &str, prefix: &str) {
+    assert!(
+        identifier.starts_with(prefix),
+        "schema identifier `{identifier}` was not prefixed with `{prefix}`"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +755,19 @@ mod tests {
         conn.query_drop("CREATE INDEX idx_example_value ON example(value)")
             .await
             .expect("pre-create index");
+        conn.query_drop("CREATE TABLE parent (id VARCHAR(64) PRIMARY KEY)")
+            .await
+            .expect("create parent table");
+        conn.query_drop(
+            "CREATE TABLE child (id VARCHAR(64) PRIMARY KEY, parent_id VARCHAR(64) NULL)",
+        )
+        .await
+        .expect("create child table");
+        conn.query_drop(
+            "ALTER TABLE child ADD CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent(id)",
+        )
+        .await
+        .expect("pre-create foreign key");
         drop(conn);
 
         // Now run the "full" migration set as if we are starting fresh: the
@@ -473,6 +792,13 @@ mod tests {
                 Migration::DropColumn {
                     table: "example",
                     column: "dropme",
+                },
+                Migration::AddForeignKey {
+                    name: "fk_child_parent",
+                    table: "child",
+                    columns: "(parent_id)",
+                    referenced_table: "parent",
+                    referenced_columns: "(id)",
                 },
             ],
         ];

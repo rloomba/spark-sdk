@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use macros::async_trait;
 use spark_postgres::deadpool_postgres;
+use spark_postgres::query::{self as pg_query, PostgresQueryExt};
 use spark_postgres::tokio_postgres;
 
 use deadpool_postgres::Pool;
@@ -29,7 +30,7 @@ use crate::{
 
 #[cfg(test)]
 use super::base::{PostgresStorageConfig, create_pool};
-use super::base::{map_db_error, map_pool_error, run_migrations};
+use super::base::{map_db_error, map_pool_error};
 
 /// Name of the schema migrations table for `PostgresStorage`.
 const MIGRATIONS_TABLE: &str = "schema_migrations";
@@ -42,9 +43,16 @@ const MIGRATIONS_TABLE: &str = "schema_migrations";
 /// without seeing each other's data.
 pub(crate) struct PostgresStorage {
     pool: Pool,
+    table_names: spark_postgres::PostgresTableNames,
     /// Tenant identity: 33-byte compressed secp256k1 pubkey. Stored as raw
     /// bytes for direct binding to BYTEA columns.
     identity: Vec<u8>,
+}
+
+impl PostgresQueryExt for PostgresStorage {
+    fn table_names(&self) -> &spark_postgres::PostgresTableNames {
+        &self.table_names
+    }
 }
 
 impl PostgresStorage {
@@ -74,16 +82,30 @@ impl PostgresStorage {
     #[cfg(test)]
     pub async fn new(config: PostgresStorageConfig, identity: &[u8]) -> Result<Self, StorageError> {
         let pool = create_pool(&config)?;
-        Self::new_with_pool(pool, identity).await
+        Self::new_with_pool_and_table_prefix(pool, identity, config.table_prefix.as_deref()).await
     }
 
     /// Creates a new `PostgresStorage` using an existing connection pool.
     ///
     /// This allows sharing a single pool across multiple store implementations.
     /// Each `PostgresStorage` is scoped to a single tenant `identity`.
+    #[allow(dead_code)]
     pub async fn new_with_pool(pool: Pool, identity: &[u8]) -> Result<Self, StorageError> {
+        Self::new_with_pool_and_table_prefix(pool, identity, None).await
+    }
+
+    /// Creates a new `PostgresStorage` using an existing connection pool and
+    /// optional table prefix.
+    pub async fn new_with_pool_and_table_prefix(
+        pool: Pool,
+        identity: &[u8],
+        table_prefix: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let table_names = spark_postgres::PostgresTableNames::new(table_prefix)
+            .map_err(|e| StorageError::InitializationError(e.to_string()))?;
         let storage = Self {
             pool,
+            table_names,
             identity: identity.to_vec(),
         };
         storage.migrate().await?;
@@ -91,12 +113,14 @@ impl PostgresStorage {
     }
 
     async fn migrate(&self) -> Result<(), StorageError> {
-        run_migrations(
+        spark_postgres::run_migrations_with_table_prefix(
             &self.pool,
             MIGRATIONS_TABLE,
             &Self::migrations(&self.identity),
+            self.table_names.prefix(),
         )
         .await
+        .map_err(StorageError::from)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -608,7 +632,8 @@ impl Storage for PostgresStorage {
 
         let offset_idx = param_idx + 1;
         let query = format!(
-            "{SELECT_PAYMENT_SQL} {where_sql} ORDER BY p.timestamp {order_direction} LIMIT ${param_idx} OFFSET ${offset_idx}"
+            "{} {where_sql} ORDER BY p.timestamp {order_direction} LIMIT ${param_idx} OFFSET ${offset_idx}",
+            pg_query::sql(&self.table_names, SELECT_PAYMENT_SQL)
         );
 
         params.push(Box::new(limit));
@@ -619,8 +644,8 @@ impl Storage for PostgresStorage {
             .map(|p| p.as_ref() as &(dyn ToSql + Sync))
             .collect();
 
-        let rows = client
-            .query(&query, &param_refs)
+        let rows = self
+            .query(&client, &query, &param_refs)
             .await
             .map_err(map_db_error)?;
 
@@ -647,7 +672,8 @@ impl Storage for PostgresStorage {
             };
 
         // Insert or update main payment record (including detail columns atomically)
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO payments (user_id, id, payment_type, status, amount, fees, timestamp, method, withdraw_tx_id, deposit_tx_id, spark)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT(user_id, id) DO UPDATE SET
@@ -685,7 +711,8 @@ impl Storage for PostgresStorage {
                 if invoice_details.is_some() || htlc_details.is_some() {
                     let invoice_json = to_json_opt(invoice_details.as_ref())?;
                     let htlc_json = to_json_opt(htlc_details.as_ref())?;
-                    tx.execute(
+                    pg_query::execute(&self.table_names,
+                        &tx,
                         "INSERT INTO payment_details_spark (user_id, payment_id, invoice_details, htlc_details)
                              VALUES ($1, $2, $3, $4)
                              ON CONFLICT(user_id, payment_id) DO UPDATE SET
@@ -706,7 +733,8 @@ impl Storage for PostgresStorage {
                 let metadata_json = serde_json::to_value(&metadata)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 let invoice_json = to_json_opt(invoice_details.as_ref())?;
-                tx.execute(
+                pg_query::execute(&self.table_names,
+                    &tx,
                     "INSERT INTO payment_details_token (user_id, payment_id, metadata, tx_hash, tx_type, invoice_details)
                          VALUES ($1, $2, $3, $4, $5, $6)
                          ON CONFLICT(user_id, payment_id) DO UPDATE SET
@@ -729,7 +757,8 @@ impl Storage for PostgresStorage {
                 let preimage = &htlc_details.preimage;
                 let htlc_status = htlc_details.status.to_string();
                 let htlc_expiry_time = i64::try_from(htlc_details.expiry_time)?;
-                tx.execute(
+                pg_query::execute(&self.table_names,
+                    &tx,
                     "INSERT INTO payment_details_lightning (user_id, payment_id, invoice, payment_hash, destination_pubkey, description, preimage, htlc_status, htlc_expiry_time)
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                          ON CONFLICT(user_id, payment_id) DO UPDATE SET
@@ -768,8 +797,9 @@ impl Storage for PostgresStorage {
             .as_ref()
             .map(std::string::ToString::to_string);
 
-        client
+        self
             .execute(
+                &client,
                 "INSERT INTO payment_metadata (user_id, payment_id, parent_payment_id, lnurl_pay_info, lnurl_withdraw_info, lnurl_description, conversion_info, conversion_status)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT(user_id, payment_id) DO UPDATE SET
@@ -798,13 +828,14 @@ impl Storage for PostgresStorage {
     async fn set_cached_item(&self, key: String, value: String) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        client
-            .execute(
-                "INSERT INTO settings (user_id, key, value) VALUES ($1, $2, $3)
+        pg_query::execute(
+            &self.table_names,
+            &client,
+            "INSERT INTO settings (user_id, key, value) VALUES ($1, $2, $3)
                  ON CONFLICT(user_id, key) DO UPDATE SET value = EXCLUDED.value",
-                &[&self.identity, &key, &value],
-            )
-            .await?;
+            &[&self.identity, &key, &value],
+        )
+        .await?;
 
         Ok(())
     }
@@ -812,8 +843,9 @@ impl Storage for PostgresStorage {
     async fn get_cached_item(&self, key: String) -> Result<Option<String>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        let row = client
+        let row = self
             .query_opt(
+                &client,
                 "SELECT value FROM settings WHERE user_id = $1 AND key = $2",
                 &[&self.identity, &key],
             )
@@ -825,21 +857,25 @@ impl Storage for PostgresStorage {
     async fn delete_cached_item(&self, key: String) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        client
-            .execute(
-                "DELETE FROM settings WHERE user_id = $1 AND key = $2",
-                &[&self.identity, &key],
-            )
-            .await?;
+        pg_query::execute(
+            &self.table_names,
+            &client,
+            "DELETE FROM settings WHERE user_id = $1 AND key = $2",
+            &[&self.identity, &key],
+        )
+        .await?;
 
         Ok(())
     }
 
     async fn get_payment_by_id(&self, id: String) -> Result<Payment, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        let query = format!("{SELECT_PAYMENT_SQL} WHERE p.user_id = $1 AND p.id = $2");
-        let row = client
-            .query_one(&query, &[&self.identity, &id])
+        let query = format!(
+            "{} WHERE p.user_id = $1 AND p.id = $2",
+            pg_query::sql(&self.table_names, SELECT_PAYMENT_SQL)
+        );
+        let row = self
+            .query_one(&client, &query, &[&self.identity, &id])
             .await
             .map_err(map_db_error)?;
         map_payment(&row)
@@ -850,9 +886,12 @@ impl Storage for PostgresStorage {
         invoice: String,
     ) -> Result<Option<Payment>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        let query = format!("{SELECT_PAYMENT_SQL} WHERE p.user_id = $1 AND l.invoice = $2");
-        let row = client
-            .query_opt(&query, &[&self.identity, &invoice])
+        let query = format!(
+            "{} WHERE p.user_id = $1 AND l.invoice = $2",
+            pg_query::sql(&self.table_names, SELECT_PAYMENT_SQL)
+        );
+        let row = self
+            .query_opt(&client, &query, &[&self.identity, &invoice])
             .await?;
 
         match row {
@@ -873,8 +912,9 @@ impl Storage for PostgresStorage {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
         // Early exit if no related payments exist for this tenant
-        let has_related: bool = client
+        let has_related: bool = self
             .query_one(
+                &client,
                 "SELECT EXISTS(SELECT 1 FROM payment_metadata WHERE user_id = $1 AND parent_payment_id IS NOT NULL LIMIT 1)",
                 &[&self.identity],
             )
@@ -895,7 +935,8 @@ impl Storage for PostgresStorage {
         let in_clause = placeholders.join(", ");
 
         let query = format!(
-            "{SELECT_PAYMENT_SQL} WHERE p.user_id = $1 AND pm.parent_payment_id IN ({in_clause}) ORDER BY p.timestamp ASC"
+            "{} WHERE p.user_id = $1 AND pm.parent_payment_id IN ({in_clause}) ORDER BY p.timestamp ASC",
+            pg_query::sql(&self.table_names, SELECT_PAYMENT_SQL)
         );
 
         let mut params: Vec<&(dyn ToSql + Sync)> = vec![&self.identity];
@@ -905,7 +946,7 @@ impl Storage for PostgresStorage {
                 .map(|id| id as &(dyn ToSql + Sync)),
         );
 
-        let rows = client.query(&query, &params).await?;
+        let rows = pg_query::query(&self.table_names, &client, &query, &params).await?;
 
         let mut result: HashMap<String, Vec<Payment>> = HashMap::new();
         for row in rows {
@@ -925,8 +966,9 @@ impl Storage for PostgresStorage {
         is_mature: bool,
     ) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        client
+        self
             .execute(
+                &client,
                 "INSERT INTO unclaimed_deposits (user_id, txid, vout, amount_sats, is_mature)
                  VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT(user_id, txid, vout) DO UPDATE SET is_mature = EXCLUDED.is_mature, amount_sats = EXCLUDED.amount_sats",
@@ -944,19 +986,21 @@ impl Storage for PostgresStorage {
 
     async fn delete_deposit(&self, txid: String, vout: u32) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        client
-            .execute(
-                "DELETE FROM unclaimed_deposits WHERE user_id = $1 AND txid = $2 AND vout = $3",
-                &[&self.identity, &txid, &i32::try_from(vout)?],
-            )
-            .await?;
+        pg_query::execute(
+            &self.table_names,
+            &client,
+            "DELETE FROM unclaimed_deposits WHERE user_id = $1 AND txid = $2 AND vout = $3",
+            &[&self.identity, &txid, &i32::try_from(vout)?],
+        )
+        .await?;
         Ok(())
     }
 
     async fn list_deposits(&self) -> Result<Vec<DepositInfo>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 "SELECT txid, vout, amount_sats, is_mature, claim_error, refund_tx, refund_tx_id FROM unclaimed_deposits WHERE user_id = $1",
                 &[&self.identity],
             )
@@ -995,8 +1039,9 @@ impl Storage for PostgresStorage {
             UpdateDepositPayload::ClaimError { error } => {
                 let error_json = serde_json::to_value(&error)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                client
+                self
                     .execute(
+                        &client,
                         "UPDATE unclaimed_deposits SET claim_error = $1, refund_tx = NULL, refund_tx_id = NULL WHERE user_id = $2 AND txid = $3 AND vout = $4",
                         &[&error_json, &self.identity, &txid, &i32::try_from(vout)?],
                     )
@@ -1006,8 +1051,9 @@ impl Storage for PostgresStorage {
                 refund_txid,
                 refund_tx,
             } => {
-                client
+                self
                     .execute(
+                        &client,
                         "UPDATE unclaimed_deposits SET refund_tx = $1, refund_tx_id = $2, claim_error = NULL WHERE user_id = $3 AND txid = $4 AND vout = $5",
                         &[&refund_tx, &refund_txid, &self.identity, &txid, &i32::try_from(vout)?],
                     )
@@ -1023,8 +1069,9 @@ impl Storage for PostgresStorage {
     ) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
         for m in metadata {
-            client
+            self
                 .execute(
+                    &client,
                     "INSERT INTO lnurl_receive_metadata (user_id, payment_hash, nostr_zap_request, nostr_zap_receipt, sender_comment)
                      VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT(user_id, payment_hash) DO UPDATE SET
@@ -1046,8 +1093,9 @@ impl Storage for PostgresStorage {
         let limit = i64::from(request.limit.unwrap_or(u32::MAX));
         let offset = i64::from(request.offset.unwrap_or(0));
 
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 "SELECT id, name, payment_identifier, created_at, updated_at
                  FROM contacts WHERE user_id = $1 ORDER BY name ASC LIMIT $2 OFFSET $3",
                 &[&self.identity, &limit, &offset],
@@ -1069,8 +1117,9 @@ impl Storage for PostgresStorage {
 
     async fn get_contact(&self, id: String) -> Result<Contact, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        let row = client
+        let row = self
             .query_opt(
+                &client,
                 "SELECT id, name, payment_identifier, created_at, updated_at
                  FROM contacts WHERE user_id = $1 AND id = $2",
                 &[&self.identity, &id],
@@ -1088,8 +1137,9 @@ impl Storage for PostgresStorage {
 
     async fn insert_contact(&self, contact: Contact) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        let result = client
+        let result = self
             .execute(
+                &client,
                 "INSERT INTO contacts (user_id, id, name, payment_identifier, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (user_id, id) DO UPDATE SET
@@ -1115,12 +1165,13 @@ impl Storage for PostgresStorage {
 
     async fn delete_contact(&self, id: String) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
-        client
-            .execute(
-                "DELETE FROM contacts WHERE user_id = $1 AND id = $2",
-                &[&self.identity, &id],
-            )
-            .await?;
+        pg_query::execute(
+            &self.table_names,
+            &client,
+            "DELETE FROM contacts WHERE user_id = $1 AND id = $2",
+            &[&self.identity, &id],
+        )
+        .await?;
         Ok(())
     }
 
@@ -1137,8 +1188,9 @@ impl Storage for PostgresStorage {
 
         // This revision is a local queue id for pending rows, not a server revision.
         // Scoped per-tenant so two tenants don't share a queue.
-        let local_revision: i64 = tx
+        let local_revision: i64 = self
             .query_one(
+                &tx,
                 "SELECT COALESCE(MAX(revision), 0) + 1 FROM sync_outgoing WHERE user_id = $1",
                 &[&self.identity],
             )
@@ -1150,7 +1202,8 @@ impl Storage for PostgresStorage {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let commit_time = chrono::Utc::now().timestamp();
 
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO sync_outgoing (user_id, record_type, data_id, schema_version, commit_time, updated_fields_json, revision)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)",
             &[
@@ -1186,8 +1239,9 @@ impl Storage for PostgresStorage {
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
-        let rows_deleted = tx
+        let rows_deleted = self
             .execute(
+                &tx,
                 "DELETE FROM sync_outgoing WHERE user_id = $1 AND record_type = $2 AND data_id = $3 AND revision = $4",
                 &[
                     &self.identity,
@@ -1211,7 +1265,8 @@ impl Storage for PostgresStorage {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let commit_time = chrono::Utc::now().timestamp();
 
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO sync_state (user_id, record_type, data_id, schema_version, commit_time, data, revision)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT(user_id, record_type, data_id) DO UPDATE SET
@@ -1234,7 +1289,8 @@ impl Storage for PostgresStorage {
 
         // Upsert this tenant's revision row. The migration creates a row at backfill, but
         // a fresh tenant joining a shared DB after migration won't have one yet.
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO sync_revision (user_id, revision) VALUES ($1, $2) \
              ON CONFLICT (user_id) DO UPDATE SET revision = GREATEST(sync_revision.revision, EXCLUDED.revision)",
             &[&self.identity, &i64::try_from(record.revision)?],
@@ -1255,8 +1311,9 @@ impl Storage for PostgresStorage {
     ) -> Result<Vec<OutgoingChange>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 "SELECT o.record_type, o.data_id, o.schema_version, o.commit_time, o.updated_fields_json, o.revision,
                         e.schema_version AS existing_schema_version, e.commit_time AS existing_commit_time, e.data AS existing_data, e.revision AS existing_revision
                  FROM sync_outgoing o
@@ -1299,8 +1356,9 @@ impl Storage for PostgresStorage {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
         // A tenant that hasn't synced anything yet may not have a row. Treat missing as 0.
-        let revision: i64 = client
+        let revision: i64 = self
             .query_opt(
+                &client,
                 "SELECT revision FROM sync_revision WHERE user_id = $1",
                 &[&self.identity],
             )
@@ -1322,8 +1380,9 @@ impl Storage for PostgresStorage {
         for record in records {
             let data_json = serde_json::to_value(&record.data)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            client
+            self
                 .execute(
+                    &client,
                     "INSERT INTO sync_incoming (user_id, record_type, data_id, schema_version, commit_time, data, revision)
                      VALUES ($1, $2, $3, $4, $5, $6, $7)
                      ON CONFLICT(user_id, record_type, data_id, revision) DO UPDATE SET
@@ -1350,8 +1409,9 @@ impl Storage for PostgresStorage {
     async fn delete_incoming_record(&self, record: Record) -> Result<(), StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        client
+        self
             .execute(
+                &client,
                 "DELETE FROM sync_incoming WHERE user_id = $1 AND record_type = $2 AND data_id = $3 AND revision = $4",
                 &[
                     &self.identity,
@@ -1369,8 +1429,9 @@ impl Storage for PostgresStorage {
     async fn get_incoming_records(&self, limit: u32) -> Result<Vec<IncomingChange>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        let rows = client
+        let rows = self
             .query(
+                &client,
                 "SELECT i.record_type, i.data_id, i.schema_version, i.data, i.revision,
                         e.schema_version AS existing_schema_version, e.commit_time AS existing_commit_time, e.data AS existing_data, e.revision AS existing_revision
                  FROM sync_incoming i
@@ -1416,8 +1477,9 @@ impl Storage for PostgresStorage {
     async fn get_latest_outgoing_change(&self) -> Result<Option<OutgoingChange>, StorageError> {
         let client = self.pool.get().await.map_err(map_pool_error)?;
 
-        let row = client
+        let row = self
             .query_opt(
+                &client,
                 "SELECT o.record_type, o.data_id, o.schema_version, o.commit_time, o.updated_fields_json, o.revision,
                         e.schema_version AS existing_schema_version, e.commit_time AS existing_commit_time, e.data AS existing_data, e.revision AS existing_revision
                  FROM sync_outgoing o
@@ -1467,7 +1529,8 @@ impl Storage for PostgresStorage {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let commit_time = chrono::Utc::now().timestamp();
 
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO sync_state (user_id, record_type, data_id, schema_version, commit_time, data, revision)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT(user_id, record_type, data_id) DO UPDATE SET
@@ -1489,7 +1552,8 @@ impl Storage for PostgresStorage {
         .map_err(|e| StorageError::Connection(e.to_string()))?;
 
         // Upsert this tenant's revision row.
-        tx.execute(
+        pg_query::execute(&self.table_names,
+            &tx,
             "INSERT INTO sync_revision (user_id, revision) VALUES ($1, $2) \
              ON CONFLICT (user_id) DO UPDATE SET revision = GREATEST(sync_revision.revision, EXCLUDED.revision)",
             &[&self.identity, &i64::try_from(record.revision)?],
@@ -1721,6 +1785,10 @@ mod tests {
 
     impl PostgresTestFixture {
         async fn new() -> Self {
+            Self::new_with_table_prefix(None).await
+        }
+
+        async fn new_with_table_prefix(table_prefix: Option<String>) -> Self {
             // Start a PostgreSQL container using testcontainers
             let container = Postgres::default()
                 .start()
@@ -1738,20 +1806,39 @@ mod tests {
                 "host=127.0.0.1 port={host_port} user=postgres password=postgres dbname=postgres"
             );
 
-            let storage = PostgresStorage::new(
-                PostgresStorageConfig::with_defaults(connection_string),
-                &TEST_IDENTITY_A,
-            )
-            .await
-            .expect("Failed to create PostgresStorage");
+            let mut config = PostgresStorageConfig::with_defaults(connection_string);
+            config.table_prefix = table_prefix;
+
+            let storage = PostgresStorage::new(config, &TEST_IDENTITY_A)
+                .await
+                .expect("Failed to create PostgresStorage");
 
             Self { storage, container }
         }
     }
 
+    #[test]
+    fn core_migrations_schema_objects_are_known() {
+        let migrations = PostgresStorage::migrations(&TEST_IDENTITY_A);
+
+        spark_postgres::migrations::assert_migrations_schema_objects_known(
+            &migrations,
+            &[MIGRATIONS_TABLE],
+        );
+    }
+
     #[tokio::test]
     async fn test_postgres_storage() {
         let fixture = PostgresTestFixture::new().await;
+        Box::pin(crate::persist::tests::test_storage(Box::new(
+            fixture.storage,
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_postgres_storage_with_prefix() {
+        let fixture = PostgresTestFixture::new_with_table_prefix(Some("breez_".to_string())).await;
         Box::pin(crate::persist::tests::test_storage(Box::new(
             fixture.storage,
         )))

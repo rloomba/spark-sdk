@@ -1,0 +1,10 @@
+[package]
+name = "spark-storage"
+description = "Shared storage helpers for Spark SQL backends"
+version.workspace = true
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
